@@ -11,10 +11,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import conclusion, database, graph, review
+from app import conclusion, database, graph, proposal, review
 from app.schemas import (
     CommitRequest,
     CounterfactualRequest,
+    ProposalMergePreviewRequest,
+    ProposalMergeRequest,
+    ProposalSaveRequest,
     ReviewBallotRequest,
     ReviewCloseRequest,
     ReviewCreateRequest,
@@ -46,10 +49,16 @@ app = FastAPI(title="事故复盘因果图", version="1.0.0", lifespan=lifespan)
 
 @app.exception_handler(GraphError)
 async def graph_error_handler(request: Request, exc: GraphError) -> JSONResponse:
+    # 明确的「不存在」类错误返回 404（提案 / 版本 / 节点未找到等），其余按 400 / 显式状态码
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = 404 if exc.code in ("proposal_not_found", "version_not_found") else 400
     return JSONResponse(
-        status_code=400,
+        status_code=status,
         content={"detail": exc.message, "code": exc.code, "cycle": exc.cycle,
-                 "conflict": exc.conflict},
+                 "conflict": exc.conflict,
+                 # 合并整图校验失败时附带合并后整图，供前端定位成环 / 时间窗冲突
+                 "graph": proposal.serialize_graph(exc.graph) if exc.graph is not None else None},
     )
 
 
@@ -245,6 +254,49 @@ def close_review(session_id: int, body: ReviewCloseRequest,
                  conn: sqlite3.Connection = Depends(get_conn)):
     """封榜：写事务内校验 session_revision 与最低票数并冻结选票；过期 / 重复封榜返回 409。"""
     return review.close_session(conn, session_id, expected_revision=body.expected_revision)
+
+
+# ---------- 变更提案合并（绑定基线的提案；保存不出版本，合并裁决后事务内生成 merge 版本） ----------
+
+@app.get("/api/proposals")
+def list_proposals(conn: sqlite3.Connection = Depends(get_conn)):
+    return proposal.list_proposals(conn)
+
+
+@app.post("/api/proposals", status_code=201)
+def save_proposal(body: ProposalSaveRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """保存提案：只在绑定的基线上复用整图校验，不生成版本。"""
+    return proposal.save_proposal(conn, title=body.title, changes=body.changes)
+
+
+@app.post("/api/proposals/merge-preview")
+def merge_preview(body: ProposalMergePreviewRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """只读三方比较：自动采纳项 + 冲突清单 + 仅自动项合在一起的整图校验预览。"""
+    return proposal.build_merge_plan(conn, body.proposal_a_id, body.proposal_b_id)
+
+
+@app.post("/api/proposals/merge")
+def merge_proposals(body: ProposalMergeRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """写事务内重新合并：确认提案仍未使用、当前版本等于基线，重跑整图校验，
+    全部通过才生成 merge 版本并同时标记两份提案已合并；任一失败不留版本或已合并状态。"""
+    return proposal.merge_proposals(
+        conn,
+        proposal_a_id=body.proposal_a_id,
+        proposal_b_id=body.proposal_b_id,
+        message=body.message,
+        resolutions=body.resolutions,
+    )
+
+
+@app.get("/api/proposals/{proposal_id}")
+def get_proposal(proposal_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    return proposal.get_proposal(conn, proposal_id)
+
+
+@app.get("/api/proposals/{proposal_id}/graph")
+def get_proposal_graph(proposal_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """只读：把提案应用到其基线后的预览图（不生成版本、不写库）。"""
+    return graph_dict(proposal.preview_proposal_graph(conn, proposal_id))
 
 
 # ---------- 提交一组修改（事务：校验整张图，任一失败全部拒绝） ----------

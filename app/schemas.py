@@ -155,6 +155,28 @@ class ReviewCloseRequest(BaseModel):
     expected_revision: int = Field(ge=1)
 
 
+# ---------- 变更提案合并 ----------
+
+class ProposalSaveRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    # 与普通提交同一结构的修改集；base_version_id 即提案绑定的基线
+    changes: Changeset
+
+
+class ProposalMergePreviewRequest(BaseModel):
+    # 必须是两份不同的提案；是否同基线 / 是否仍未合并由服务端校验
+    proposal_a_id: int = Field(ge=1)
+    proposal_b_id: int = Field(ge=1)
+
+
+class ProposalMergeRequest(BaseModel):
+    proposal_a_id: int = Field(ge=1)
+    proposal_b_id: int = Field(ge=1)
+    message: str = Field(min_length=1, max_length=200)
+    # 冲突 id（节点 / 连线 id）-> "a" | "b" | "base"；必须覆盖全部冲突
+    resolutions: dict[str, Literal["a", "b", "base"]] = {}
+
+
 # ---------- 通用错误 ----------
 
 class ErrorResponse(BaseModel):

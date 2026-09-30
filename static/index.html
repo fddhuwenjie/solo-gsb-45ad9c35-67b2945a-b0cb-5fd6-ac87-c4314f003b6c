@@ -17,6 +17,7 @@
       <span class="dirty-count" id="dirtyCount"></span>
       <input type="text" id="commitMessage" maxlength="200" placeholder="本次修改说明（必填）" />
       <button id="btnCommit" class="btn btn-primary" disabled>提交一组修改（事务）</button>
+      <button id="btnSaveProposal" class="btn" disabled>存为提案…</button>
       <button id="btnDiscard" class="btn" disabled>放弃修改</button>
     </div>
   </header>
@@ -29,6 +30,11 @@
     <span id="viewBannerText"></span>
     <button class="btn btn-small" id="btnBackToCurrent">返回当前版</button>
     <button class="btn btn-small btn-warn" id="btnRollbackView">以此版本回滚</button>
+  </div>
+  <div class="banner-viewing banner-proposal" id="proposalBanner" hidden>
+    <span id="proposalBannerText"></span>
+    <button class="btn btn-small" id="btnExitProposalView">返回当前版</button>
+    <button class="btn btn-small btn-warn" id="btnBackToMerge" hidden>返回裁决</button>
   </div>
 
   <main class="layout">
@@ -188,6 +194,29 @@
         <ul class="review-list" id="reviewList"></ul>
       </div>
 
+      <div class="panel" id="proposalPanel">
+        <h3>变更提案合并</h3>
+        <p class="muted small">
+          把一组未提交修改<b>存为绑定基线的提案</b>：保存时只在对应基线上做整图校验、<b>不生成版本</b>。
+          选择两份<b>同基线且未合并</b>的提案做三方比较：单侧修改与双方相同修改直接采纳；
+          同一字段 / 连线改成不同值、删除与修改相遇则逐项裁决 A / B / 基线。
+          合并在服务端写事务内重新执行，再跑成环、时间窗等整图校验，全部通过才生成一个版本，
+          任一失败都不留版本或已合并状态。
+        </p>
+        <div id="proposalSaveBox" hidden>
+          <input type="text" id="ppTitle" maxlength="200" placeholder="提案标题，如：A 组补充根因" />
+          <div class="muted small" id="ppSaveBasis"></div>
+          <button class="btn btn-primary btn-block" id="btnDoSaveProposal">保存提案（不生成版本）</button>
+          <p class="muted small" id="ppSaveMsg"></p>
+        </div>
+        <div class="sandbox-actions">
+          <button class="btn btn-small" id="btnProposalSaveToggle">存为提案…</button>
+          <button class="btn btn-small" id="btnProposalRefresh">刷新</button>
+          <button class="btn btn-small btn-primary" id="btnOpenMerge">合并两份提案…</button>
+        </div>
+        <ul class="review-list" id="proposalList"></ul>
+      </div>
+
       <div class="panel panel-grow" id="versionsPanel">
         <h3>版本快照</h3>
         <button class="btn btn-small btn-refresh" id="btnRefreshVersions">刷新</button>
@@ -209,6 +238,25 @@
         <button class="seg-btn" data-rtab="matrix">两两矩阵</button>
       </div>
       <div class="review-body" id="reviewBody"></div>
+    </div>
+  </div>
+
+  <div class="review-modal" id="mergeModal" hidden>
+    <div class="review-dialog merge-dialog">
+      <header class="review-head">
+        <span id="mergeModalTitle">变更提案三方合并</span>
+        <button class="banner-close" id="btnMergeClose">×</button>
+      </header>
+      <div class="review-meta" id="mergeMeta"></div>
+      <div class="merge-selectors">
+        <select id="mergeSelectA"></select>
+        <span class="merge-vs">⇄</span>
+        <select id="mergeSelectB"></select>
+        <button class="btn btn-small" id="btnMergePreview">比较 / 预览</button>
+      </div>
+      <div class="review-body" id="mergeBody">
+        <p class="muted small">选择两份同基线且未合并的提案后点击「比较 / 预览」。</p>
+      </div>
     </div>
   </div>
 

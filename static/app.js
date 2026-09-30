@@ -32,6 +32,8 @@ const S = {
     sig: '',
     seq: 0,
   },
+  // 只读的提案 / 合并失败预览：viewingVersion 取值 'pp'（提案预览图）或 'mf'（合并失败整图）
+  viewMeta: null,          // {kind:'proposal'|'merge-fail', label, graph, conflictData?, cycle?, returnToMerge?}
 };
 
 function emptyHits() { return { nodes: new Set(), edges: new Set(), data: null }; }
@@ -44,7 +46,8 @@ function normalizeNode(n) {
 }
 
 function recomputeLocalConflict() {
-  if (S.viewingVersion || !S.work) { S.localConflictHits = emptyHits(); return; }
+  if (S.viewingVersion !== null && !isProposalView()) { S.localConflictHits = emptyHits(); return; }
+  // 提案 / 合并失败预览图没有服务端重算窗口：像未提交工作图一样在本地重算
   const { conflict } = computeTimeWindows(S.work.nodes, S.work.edges);
   S.localConflictHits = conflict
     ? { nodes: new Set(conflict.chain_node_ids), edges: new Set(conflict.chain_edge_ids), data: conflict }
@@ -55,6 +58,10 @@ function newChangeSet() {
   return { node_creates: [], node_updates: [], node_deletes: [],
            edge_creates: [], edge_updates: [], edge_deletes: [] };
 }
+
+/** 只读视图：浏览历史版本（数字）/ 提案预览图（'pp'）/ 合并失败整图（'mf'）。 */
+function readOnlyMode() { return S.viewingVersion !== null; }
+function isProposalView() { return S.viewingVersion === 'pp' || S.viewingVersion === 'mf'; }
 
 // ---------- 时间窗工具 ----------
 // 线与存储统一为 UTC（...Z）；用户可输入任意带时区偏移的 ISO 8601，空串表示不限。
@@ -129,12 +136,15 @@ async function loadState() {
   S.changes = newChangeSet();
   S.selected = null;
   S.viewingVersion = null;
+  S.viewMeta = null;
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  window._cycleHits = new Set();
   clearAffected();
   resetSandbox();
   renderAll();
   await refreshVersions();
   void loadReviews();
+  void loadProposals();
 }
 
 // ---------- changeset 记账 ----------
@@ -414,11 +424,11 @@ function currentTimeInfo() {
   return computeTimeWindows(S.work.nodes, S.work.edges);
 }
 
-/** 选中事件实际展示的有效时间窗：历史/干净视图用服务端，脏工作图用本地重算。 */
+/** 选中事件实际展示的有效时间窗：历史/干净视图用服务端，脏工作图 / 提案预览图用本地重算。 */
 function eventWindowFor(nodeId) {
   const n = S.work.nodes.get(nodeId);
   if (!n || n.type !== 'event') return null;
-  if (S.viewingVersion || changeCount() === 0) {
+  if (S.viewingVersion !== null && !isProposalView()) {
     return n.time_window || null;  // 服务端已按所查看版本重算
   }
   return currentTimeInfo().windows.get(nodeId) || null;
@@ -511,8 +521,9 @@ function applyView() {
 
 function renderAll() {
   recomputeLocalConflict();
-  // 未提交工作图：证据强度审查实时重算；干净视图 / 历史快照用服务端按各自版本算好的结果
-  S.localReviews = (!S.viewingVersion && changeCount() > 0)
+  // 未提交工作图 / 提案预览图 / 合并失败整图：证据审查实时重算；历史快照用服务端结果
+  const localLike = S.viewingVersion === null || isProposalView();
+  S.localReviews = (localLike && (changeCount() > 0 || isProposalView()))
     ? computeEvidenceReview(S.work.nodes, S.work.edges) : null;
   // 先同步沙盘控件（结构变化时重建列表并丢弃过期依据树），再按需本地即时推演
   pruneSandboxSelection();
@@ -537,21 +548,30 @@ function renderAll() {
 }
 
 function renderHeader() {
-  const label = S.viewingVersion ? `只读 v${S.viewingVersion}` : `v${S.work.version_id}`;
+  const label = S.viewingVersion === 'pp' ? `提案预览 v${S.work.version_id}`
+    : S.viewingVersion === 'mf' ? `合并预览 v${S.work.version_id}`
+    : S.viewingVersion ? `只读 v${S.viewingVersion}` : `v${S.work.version_id}`;
   $('versionBadge').textContent = label;
   const n = changeCount();
   $('dirtyCount').textContent = n ? `● ${n} 项未提交` : '';
   $('btnCommit').disabled = !n || !$('commitMessage').value.trim() || !!S.viewingVersion;
+  $('btnSaveProposal').disabled = !n || !!S.viewingVersion;
   $('btnDiscard').disabled = !n || !!S.viewingVersion;
-  $('viewBanner').hidden = !S.viewingVersion;
-  if (S.viewingVersion) {
+  $('viewBanner').hidden = !(S.viewingVersion && !isProposalView());
+  if (S.viewingVersion && !isProposalView()) {
     $('viewBannerText').textContent = `正在浏览历史快照 v${S.viewingVersion}（只读）。当前最新版本为 v${S.committed.version_id}。`;
+  }
+  // 提案 / 合并失败预览走独立横幅
+  $('proposalBanner').hidden = !isProposalView();
+  if (isProposalView()) {
+    const meta = S.viewMeta || {};
+    $('proposalBannerText').textContent = meta.label || '只读预览（不生成版本）';
+    $('btnBackToMerge').hidden = !(meta.kind === 'merge-fail' && meta.returnToMerge);
   }
 }
 
 function renderNodes() {
   nodeLayer.innerHTML = '';
-  const local = (!S.viewingVersion && changeCount() > 0) ? currentTimeInfo() : null;
   // 沙盘依据树节点集合整帧只算一次
   const cfTree = (S.sandbox.active && S.sandbox.result) ? cfTreeNodeIds() : null;
   for (const n of S.work.nodes.values()) {
@@ -578,9 +598,10 @@ function renderNodes() {
     g.appendChild(el('text', { class: 'node-title', x: 10, y: 34 }, trunc(n.title, 14)));
 
     if (n.type === 'event') {
-      const tw = (local ? local.windows.get(n.id) : n.time_window) || {};
-      const lo = local ? tw.lower : tw.effective_lower;
-      const hi = local ? tw.upper : tw.effective_upper;
+      const localWin = localComputeView() ? currentTimeInfo().windows.get(n.id) : null;
+      const tw = localWin || n.time_window || {};
+      const lo = localWin ? tw.lower : tw.effective_lower;
+      const hi = localWin ? tw.upper : tw.effective_upper;
       if (lo || hi) {
         g.appendChild(el('text', { class: 'node-time', x: 10, y: 52 },
           `${fmtTimeShort(lo)}–${fmtTimeShort(hi)} UTC`));
@@ -802,10 +823,15 @@ function bindEvidenceEditor(nodeId) {
   });
 }
 
+/** 时间窗 / 证据审查是否应按本地图重算展示（脏工作图或提案 / 合并预览图）。 */
+function localComputeView() {
+  return S.viewingVersion === null ? changeCount() > 0 : isProposalView();
+}
+
 /** 有效时间窗展示；tw 可能是服务端结构（effective_lower/lower_source/lower_chain）
  *  或本地结构（lower/lowerSrc/lowerChain）。 */
 function effectiveWindowHtml(nodeId, tw) {
-  const local = !S.viewingVersion && changeCount() > 0;
+  const local = localComputeView();
   const lo = local ? tw.lower : tw.effective_lower;
   const hi = local ? tw.upper : tw.effective_upper;
   const loSrcId = local ? tw.lowerSrc : tw.lower_source?.node_id;
@@ -817,9 +843,10 @@ function effectiveWindowHtml(nodeId, tw) {
     ? (hiSrcId ? S.work.nodes.get(hiSrcId)?.title : null)
     : tw.upper_source?.title;
   const note = local
-    ? '<p class="muted small">基于未提交工作图实时重算。</p>'
-    : (S.viewingVersion ? '<p class="muted small">按当前查看的历史版本重算。</p>'
-                        : '<p class="muted small">已按整图传播：下界取自身与祖先最大，上界取自身与后代最小。</p>');
+    ? (isProposalView()
+        ? '<p class="muted small">基于提案 / 合并预览图本地重算（只读）。</p>'
+        : '<p class="muted small">基于未提交工作图实时重算。</p>')
+    : '<p class="muted small">按当前查看的历史版本重算。</p>';
   const localConflict = local && lo != null && hi != null && lo > hi
     ? S.localConflictHits.data : null;
   const conflictHtml = localConflict ? `
@@ -847,7 +874,7 @@ function effectiveWindowHtml(nodeId, tw) {
 
 /** 证据强度审查展示；rv 为服务端或本地 computeEvidenceReview 的同构结果。 */
 function evidenceReviewHtml(rv) {
-  const local = !S.viewingVersion && changeCount() > 0;
+  const local = localComputeView();
   const [label, cls] = STATUS_META[rv.status] || [rv.status, 'insufficient'];
   const relTxt = (x) => (x.reliability_set ? x.reliability.toFixed(2) : '未设置（按 0 计权）');
   const groupHtml = (g) => {
@@ -865,9 +892,10 @@ function evidenceReviewHtml(rv) {
       </div>`;
   };
   const note = local
-    ? '<p class="muted small">基于未提交工作图实时重算。</p>'
-    : (S.viewingVersion ? '<p class="muted small">按当前查看的历史版本重算。</p>'
-                        : '<p class="muted small">按当前版本计算。</p>');
+    ? (isProposalView()
+        ? '<p class="muted small">基于提案 / 合并预览图本地重算（只读）。</p>'
+        : '<p class="muted small">基于未提交工作图实时重算。</p>')
+    : '<p class="muted small">按当前查看的历史版本重算。</p>';
   return `
     <div class="review-box status-${cls}">
       <div class="window-title">证据强度审查</div>
@@ -1034,7 +1062,7 @@ async function refreshVersions() {
     if (v.id === S.viewingVersion) li.classList.add('viewing');
     li.innerHTML = `
       <div class="version-head"><span>v${v.id}</span>
-        <span class="tag ${v.kind}">${v.kind === 'commit' ? '提交' : '回滚'}</span></div>
+        <span class="tag ${v.kind}">${v.kind === 'commit' ? '提交' : v.kind === 'merge' ? '合并' : '回滚'}</span></div>
       <div class="version-msg">${esc(v.message)}</div>
       <div class="version-meta">
         <span>${v.node_count} 节点 / ${v.edge_count} 连线</span>
@@ -1111,10 +1139,10 @@ async function computeImpact(nodeId) {
   body.innerHTML = '<p class="muted">计算中…</p>';
   try {
     let data;
-    if (S.viewingVersion) {
+    if (S.viewingVersion && !isProposalView()) {
       data = await api(`/api/nodes/${encodeURIComponent(nodeId)}/downstream?version_id=${S.viewingVersion}`);
-    } else if (changeCount() > 0) {
-      // 工作图与服务端不同：用本地结果，注明未提交
+    } else if (changeCount() > 0 || isProposalView()) {
+      // 工作图 / 提案预览图与服务端版本不同：用本地结果
       data = localImpactData(nodeId);
       data.local = true;
     } else {
@@ -1151,7 +1179,7 @@ function renderImpact(nodeId, d) {
   renderEdges();
 
   $('impactBody').innerHTML = `
-    <div class="kv">根节点：<b>${esc(d.node_title)}</b>${d.local ? ' <span style="color:var(--evidence)">（基于未提交工作图）</span>' : ''}</div>
+    <div class="kv">根节点：<b>${esc(d.node_title)}</b>${d.local ? ` <span style="color:var(--evidence)">（${isProposalView() ? '基于预览图本地计算' : '基于未提交工作图'}）</span>` : ''}</div>
     <div class="impact-stat">
       <span class="stat-chip">受影响节点 <b>${d.total_affected}</b></span>
       <span class="stat-chip">事件 <b>${d.affected_events}</b></span>
@@ -1335,9 +1363,11 @@ function toggleSandboxOff() {
   renderEdges();
 }
 
-/** 当前沙盘是否应采用本地推演：未提交工作图（含未提交的 trigger_mode/拓扑变化）即时生效。 */
+/** 当前沙盘是否应采用本地推演：未提交工作图（含未提交的 trigger_mode/拓扑变化）即时生效。
+ *  历史快照 / 提案预览图调服务端（提案预览图无对应接口，本地推演即可）。 */
 function sandboxIsLocal() {
-  return !S.viewingVersion && changeCount() > 0;
+  if (S.viewingVersion === null) return changeCount() > 0;
+  return isProposalView();
 }
 
 async function syncSandbox() {
@@ -1362,12 +1392,13 @@ async function syncSandbox() {
   sb.loading = true;
   renderSandboxResult();
   try {
+    // 仅历史数字版本快照调服务端；提案 / 合并预览图在上面已走本地分支
     const res = await api('/api/counterfactual/simulate', {
       method: 'POST',
       body: JSON.stringify({
         target_id: sb.targetId,
         prevented_ids: [...sb.prevented],
-        ...(S.viewingVersion ? { version_id: S.viewingVersion } : {}),
+        ...(S.viewingVersion && !isProposalView() ? { version_id: S.viewingVersion } : {}),
       }),
     });
     if (seq === sb.seq) {
@@ -1494,7 +1525,7 @@ function renderSandboxResult() {
     </div>
     ${r.intervened_ids.length ? `<div class="muted small">干预点：
       ${r.intervened_ids.map((id) => esc(S.work.nodes.get(id)?.title || id)).join('、')}</div>` : ''}
-    <div class="tree-title">目标递归依据树${sb.local ? '（基于未提交工作图）' : ''}</div>
+    <div class="tree-title">目标递归依据树${sb.local ? `（${isProposalView() ? '基于预览图本地推演' : '基于未提交工作图'}）` : ''}</div>
     <ul class="reason-tree">${sandboxTreeHtml(r.tree)}</ul>
     <p class="muted small">依据选择：ANY 发生取 ID 最小仍发生前因、阻止时列全部前因；
       ALL 发生列全部前因、阻止时取 ID 最小已阻止前因；无前因事件默认发生。</p>`;
@@ -1516,8 +1547,9 @@ function renderSandboxResult() {
 //       重算时间窗与证据审查并逐字段比对；摘要匹配且重算一致才显示「通过」。
 const pkg = { sig: '' };
 
-/** 导出可选的根事件：历史浏览 = 该快照；否则 = 已提交当前版（未提交修改不纳入导出）。 */
+/** 导出可选的根事件：历史浏览 = 该快照；提案 / 合并预览图不支持导出；否则 = 已提交当前版。 */
 function pkgEventNodes() {
+  if (isProposalView()) return [];
   const src = S.viewingVersion ? [...S.work.nodes.values()] : (S.committed?.nodes || []);
   return src.filter((n) => n.type === 'event')
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -1525,7 +1557,8 @@ function pkgEventNodes() {
 
 function renderPkgControls() {
   const events = pkgEventNodes();
-  const sig = (S.viewingVersion || 'cur') + '|' + events.map((n) => n.id).join('|');
+  const sig = ((S.viewingVersion && !isProposalView()) ? S.viewingVersion : 'cur')
+    + '|' + events.map((n) => n.id).join('|');
   const sel = $('pkgEvent');
   if (pkg.sig !== sig) {
     const prev = sel.value;
@@ -1545,7 +1578,9 @@ function renderPkgControls() {
     }
   }
   $('btnPkgExport').disabled = !events.length;
-  $('pkgBasis').textContent = S.viewingVersion
+  $('pkgBasis').textContent = isProposalView()
+    ? '提案 / 合并预览图为只读临时视图，不支持导出结论包；请返回当前版或历史版本。'
+    : S.viewingVersion
     ? `导出基于所浏览的历史快照 v${S.viewingVersion}（只读）。`
     : `导出基于当前版 v${S.committed?.version_id ?? '-'}` +
       (changeCount() ? '；存在未提交修改，不包含在导出中。' : '。');
@@ -1554,7 +1589,7 @@ function renderPkgControls() {
 async function exportConclusionPackage() {
   const eventId = $('pkgEvent').value;
   if (!eventId) { flashBanner('请先选择要导出的根事件。'); return; }
-  const qs = S.viewingVersion ? `?version_id=${S.viewingVersion}` : '';
+  const qs = (S.viewingVersion && !isProposalView()) ? `?version_id=${S.viewingVersion}` : '';
   try {
     const res = await fetch(`/api/conclusion/export/${encodeURIComponent(eventId)}${qs}`);
     if (!res.ok) {
@@ -2153,6 +2188,462 @@ svg.addEventListener('wheel', (ev) => {
   zoomAt(ev, ev.deltaY < 0 ? 1.1 : 0.9);
 }, { passive: false });
 
+// ---------- 变更提案合并 ----------
+//
+// 保存：把当前未提交修改（changeset）绑定 S.work.version_id 存为提案；服务端只在该基线上
+//       复用整图校验，不生成版本。原 changeset 提交与历史版本不受影响。
+// 合并：选两份同基线未合并提案 → /merge-preview 得到自动采纳项与冲突清单 → 逐项裁决
+//       A/B/基线 → /merge 在服务端写事务内重新合并并再跑成环 / 时间窗等整图校验，
+//       全部通过才生成 merge 版本并同时标记两份提案已合并；失败时整批回滚并返回合并后
+//       整图（graph），可一键定位冲突链。
+const PP = {
+  list: [],             // 提案摘要列表
+  plan: null,           // 最近一次 merge-preview 结果
+  aId: null,
+  bId: null,
+  resolutions: {},      // conflict id -> 'a'|'b'|'base'
+  lastFailGraph: null,  // 合并失败返回的合并后整图
+};
+
+const FIELD_LABELS = {
+  title: '标题', description: '描述', pos_x: 'X 坐标', pos_y: 'Y 坐标',
+  earliest_time: '最早时间', latest_time: '最晚时间',
+  reliability: '可靠度', source_group: '来源组', trigger_mode: '触发模式',
+  kind: '连线类型', label: '连线说明', source_id: '起点', target_id: '终点',
+};
+const fieldLabel = (f) => FIELD_LABELS[f] || f;
+
+function fmtVal(v) {
+  if (v === null || v === undefined || v === '') return '（空）';
+  if (typeof v === 'number') return String(v);
+  return String(v);
+}
+
+async function loadProposals() {
+  try {
+    const d = await api('/api/proposals');
+    PP.list = d.proposals;
+  } catch (_) { PP.list = []; }
+  renderProposalList();
+  renderMergeSelectors();
+}
+
+function countsLine(c) {
+  const parts = [];
+  const map = [['node_creates', '建节点'], ['node_updates', '改节点'], ['node_deletes', '删节点'],
+               ['edge_creates', '建连线'], ['edge_updates', '改连线'], ['edge_deletes', '删连线']];
+  for (const [k, label] of map) if (c[k]) parts.push(`${label} ${c[k]}`);
+  return parts.join(' · ') || '无修改';
+}
+
+function renderProposalList() {
+  const ul = $('proposalList');
+  ul.innerHTML = '';
+  if (!PP.list.length) {
+    const li = hEl('li');
+    li.className = 'muted small';
+    li.style.listStyle = 'none';
+    li.textContent = '暂无提案：先在画布上做修改，再点「存为提案…」。';
+    ul.appendChild(li);
+    return;
+  }
+  for (const p of PP.list) {
+    const li = hEl('li', { class: `proposal-item ${p.status}` });
+    const merged = p.status === 'merged';
+    li.innerHTML = `
+      <div class="version-head">
+        <span>#${p.id} ${esc(p.title)}</span>
+        <span class="tag ${merged ? 'proposal-merged' : 'proposal-open'}">${merged ? '已合并' : '未合并'}</span>
+      </div>
+      <div class="version-meta">
+        <span>基线 v${p.base_version_id}</span>
+        <span>${esc(countsLine(p.counts))}</span>
+        ${merged ? `<span>并入 v${p.merged_into}</span>` : ''}
+      </div>
+      <div class="version-meta"><span>${esc((p.created_at || '').replace('T', ' ').replace('Z', ' UTC'))}</span></div>`;
+    if (!merged) {
+      li.addEventListener('click', () => openProposalGraph(p.id, p.title, p.base_version_id));
+      li.title = '点击在画布上只读预览该提案（应用到其基线）';
+    }
+    ul.appendChild(li);
+  }
+}
+
+function renderMergeSelectors() {
+  const fill = (sel, keep) => {
+    const prev = keep || sel.value;
+    sel.innerHTML = '';
+    const o0 = hEl('option', { value: '' });
+    o0.textContent = '— 选择提案 —';
+    sel.appendChild(o0);
+    for (const p of PP.list) {
+      if (p.status !== 'open') continue;
+      const o = hEl('option', { value: String(p.id) });
+      o.textContent = `#${p.id} · ${p.title}（基线 v${p.base_version_id}）`;
+      sel.appendChild(o);
+    }
+    if ([...sel.options].some((o) => o.value === String(prev))) sel.value = String(prev);
+  };
+  fill($('mergeSelectA'), PP.aId);
+  fill($('mergeSelectB'), PP.bId);
+}
+
+async function toggleProposalSave() {
+  if (readOnlyMode()) { flashBanner('只读视图下不能保存提案，请先返回当前版。'); return; }
+  const box = $('proposalSaveBox');
+  box.hidden = !box.hidden;
+  if (box.hidden) return;
+  $('ppSaveBasis').textContent = changeCount()
+    ? `将绑定当前基线 v${S.work.version_id}，保存 ${changeCount()} 项修改；保存时在该基线上整图校验，不生成版本。`
+    : '当前没有未提交修改，请先在画布上编辑。';
+  $('btnDoSaveProposal').disabled = !changeCount();
+  $('ppSaveMsg').textContent = '';
+  if (changeCount() && !$('ppTitle').value.trim()) {
+    $('ppTitle').value = $('commitMessage').value.trim() || '';
+  }
+}
+
+async function saveProposal() {
+  if (!changeCount()) { $('ppSaveMsg').textContent = '没有未提交修改。'; return; }
+  const title = $('ppTitle').value.trim();
+  if (!title) { $('ppSaveMsg').textContent = '请填写提案标题。'; return; }
+  $('btnDoSaveProposal').disabled = true;
+  try {
+    const p = await api('/api/proposals', {
+      method: 'POST',
+      body: JSON.stringify({ title, changes: { ...S.changes, base_version_id: S.work.version_id } }),
+    });
+    $('ppSaveMsg').textContent = '';
+    $('ppTitle').value = '';
+    $('proposalSaveBox').hidden = true;
+    await loadProposals();
+    toast(`提案 #${p.id} 已保存（绑定 v${p.base_version_id}，未生成版本；画布修改已保留，可继续编辑或放弃）`);
+  } catch (err) {
+    $('ppSaveMsg').textContent = err.message;
+    $('btnDoSaveProposal').disabled = false;
+  }
+}
+
+async function openProposalGraph(id, title, baseVid) {
+  try {
+    const g = await api(`/api/proposals/${id}/graph`);
+    enterReadOnlyGraph(g, {
+      kind: 'proposal',
+      label: `提案 #${id}「${title}」应用到基线 v${baseVid} 的预览（只读，未生成版本）`,
+    });
+  } catch (err) { flashBanner(err.message); }
+}
+
+/** 进入一张只读图视图：proposal 预览图 / 合并失败的合并后整图（均无服务端重算窗口）。
+ *  当前未提交修改暂存到 viewMeta.stashedChanges，返回当前版时随 loadState 丢弃/重建。 */
+function enterReadOnlyGraph(g, meta) {
+  hideError();
+  meta.stashedChanges = S.changes;
+  S.work = snapshotFromServer(g);
+  S.changes = newChangeSet();  // 预览图里不显示工作区的脏标记
+  S.selected = null;
+  S.viewingVersion = meta.kind === 'proposal' ? 'pp' : 'mf';
+  S.viewMeta = meta;
+  S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  if (meta.conflictData) {
+    S.conflictHits = {
+      nodes: new Set(meta.conflictData.chain_node_ids || []),
+      edges: new Set(meta.conflictData.chain_edge_ids || []),
+      data: meta.conflictData,
+    };
+  }
+  window._cycleHits = new Set(meta.cycle || []);
+  clearAffected();
+  resetSandbox();
+  renderAll();
+  renderHeader();
+}
+
+async function exitReadOnlyGraph() {
+  S.viewMeta = null;
+  window._cycleHits = new Set();
+  await loadState();
+}
+
+// ---------- 合并弹窗 ----------
+
+async function openMergeModal() {
+  await loadProposals();
+  PP.plan = null;
+  PP.resolutions = {};
+  PP.lastFailGraph = null;
+  $('mergeModal').hidden = false;
+  $('mergeBody').innerHTML = '<p class="muted small">选择两份同基线且未合并的提案后点击「比较 / 预览」。</p>';
+  $('mergeMeta').textContent = '';
+}
+
+function closeMergeModal() {
+  $('mergeModal').hidden = true;
+  PP.plan = null;
+}
+
+async function runMergePreview() {
+  const a = Number($('mergeSelectA').value);
+  const b = Number($('mergeSelectB').value);
+  PP.aId = a || null; PP.bId = b || null;
+  if (!a || !b) { flashBanner('请先选择两份提案。'); return; }
+  if (a === b) { flashBanner('必须选择两份不同的提案。'); return; }
+  try {
+    PP.plan = await api('/api/proposals/merge-preview', {
+      method: 'POST', body: JSON.stringify({ proposal_a_id: a, proposal_b_id: b }),
+    });
+    // 若换了一对提案，清掉旧裁决
+    const key = `${a}/${b}`;
+    if (PP._planKey !== key) { PP._planKey = key; PP.resolutions = {}; }
+    renderMergePlan();
+  } catch (err) {
+    PP.plan = null;
+    $('mergeMeta').textContent = '';
+    $('mergeBody').innerHTML = `<div class="mc-check bad">无法比较：${esc(err.message)}</div>`;
+  }
+}
+
+function valCell(v, cls) {
+  const empty = v === null || v === undefined || v === '';
+  return `<div class="mc-val ${cls}${empty ? ' empty' : ''}" title="${esc(fmtVal(v))}">${esc(fmtVal(v))}</div>`;
+}
+
+function fieldConflictHtml(c) {
+  // 字段级冲突允许逐字段裁决；resolutions 键为 `<实体id>:<字段名>`。
+  // delete_modify 也可能带字段信息（一方删除、另一方改了同字段），统一走实体级键。
+  const rows = c.conflict_fields.map((f) => {
+    const canBase = f.resolutions.includes('base');
+    const key = `${c.id}:${f.field}`;
+    const picked = PP.resolutions[key] ?? PP.resolutions[c.id];
+    const btn = (side, allowed, label) => `
+      <button data-side="${side}" data-key="${esc(key)}" data-entity="${esc(c.id)}"
+        class="${picked === side ? 'picked ' + side : ''}" ${allowed ? '' : 'disabled title="双方都是新建，基线无此字段"'}>${label}</button>`;
+    return `
+      <div class="mc-field">
+        <span class="fname">${esc(fieldLabel(f.field))}</span>
+        ${valCell(f.base, 'side-base')}${valCell(f.a, 'side-a')}${valCell(f.b, 'side-b')}
+        <span class="mc-choice">${btn('a', true, 'A')}${btn('b', true, 'B')}${btn('base', canBase, '基线')}</span>
+      </div>`;
+  }).join('');
+  return `
+    <div class="mc-fields">
+      <div class="mc-field" style="font-weight:600;color:var(--text-dim)">
+        <span>字段</span><span>基线</span><span>提案 A</span><span>提案 B</span><span>裁决</span>
+      </div>
+      ${rows}
+    </div>
+    <div class="mc-dm">
+      <span class="muted small">本实体所有冲突字段一键：</span>
+      <span class="mc-choice">
+        <button data-side="a" data-allfields="${esc(c.id)}">全选 A</button>
+        <button data-side="b" data-allfields="${esc(c.id)}">全选 B</button>
+        <button data-side="base" data-allfields="${esc(c.id)}">全回基线</button>
+      </span>
+    </div>`;
+}
+
+function deleteModifyHtml(c) {
+  const deleteSide = c.delete_side;            // 被删除的一侧
+  const keepSide = deleteSide === 'a' ? 'b' : 'a';
+  const picked = PP.resolutions[c.id];
+  const btn = (side, label, hint) => `
+    <button data-side="${side}" data-key="${esc(c.id)}"
+      title="${esc(hint)}" class="${picked === side ? 'picked ' + side : ''}">${label}</button>`;
+  return `
+    <div class="mc-dm">
+      <span class="mc-choice">
+        ${btn(deleteSide, `按 ${deleteSide.toUpperCase()} 删除`, `采纳提案 ${deleteSide.toUpperCase()}：删除该${c.kind === 'node' ? '节点（关联边一并删除）' : '连线'}`)}
+        ${btn(keepSide, `按 ${keepSide.toUpperCase()} 保留`, `采纳提案 ${keepSide.toUpperCase()}：保留其修改后的版本`)}
+        ${btn('base', '保留基线版本', '放弃两侧改动，回到基线')}
+      </span>
+    </div>`;
+}
+
+function conflictCardHtml(c, idx) {
+  const resolved = isConflictResolved(c);
+  const kindLabel = c.kind === 'node' ? '节点' : '连线';
+  const typeLabel = c.conflict_type === 'fields' ? '字段值冲突'
+    : c.conflict_type === 'create_create' ? '双方新建取值不同' : '删除与修改相遇';
+  let name = c.a_entity?.title || c.b_entity?.title || c.base_entity?.title
+    || c.a_entity?.label || c.b_entity?.label || c.base_entity?.label || c.id;
+  if (c.kind === 'edge' && !name.trim()) name = `连线 ${c.id}`;
+  const locate = `
+    <button class="mc-locate" data-locate="${esc(c.id)}" title="在画布上定位该元素">定位</button>`;
+  let body = '';
+  if (c.conflict_type === 'delete_modify') body = deleteModifyHtml(c);
+  else body = fieldConflictHtml(c);
+  const deps = c.dependent_edge_ids?.length
+    ? `<div class="mc-deps">关联边：${c.dependent_edge_ids.map(esc).join('、')}（将随本裁决保留或删除）</div>` : '';
+  return `
+    <div class="mc-card ${resolved ? 'resolved' : 'unresolved'}" data-idx="${idx}">
+      <div class="mc-head">
+        <span class="mc-id">${esc(name)} <span class="mc-kind">${kindLabel} · ${esc(c.id)} · ${typeLabel}</span></span>
+        <span>${locate}</span>
+      </div>
+      ${body}${deps}
+    </div>`;
+}
+
+/** 删除/修改类冲突看实体键；字段类冲突要求每个冲突字段都有 `<id>:<field>` 裁决。 */
+function isConflictResolved(c) {
+  if (c.conflict_type === 'delete_modify') return PP.resolutions[c.id] !== undefined;
+  return c.conflict_fields.every((f) => PP.resolutions[`${c.id}:${f.field}`] !== undefined);
+}
+
+function autoSummaryHtml(plan) {
+  const c = plan.auto_changes.changes;
+  const items = [];
+  const act = (label, n, cls) => n ? `<span class="act-${cls}">${label} ${n}</span>` : '';
+  const summary = [
+    act('新建节点', c.node_creates, 'create'), act('更新节点', c.node_updates, 'update'),
+    act('删除节点', c.node_deletes, 'delete'),
+    act('新建连线', c.edge_creates, 'create'), act('更新连线', c.edge_updates, 'update'),
+    act('删除连线', c.edge_deletes, 'delete'),
+  ].filter(Boolean).join(' · ');
+  const ap = plan.auto_preview;
+  const check = ap.ok
+    ? `<div class="mc-check ok">✔ 自动采纳项合在一起通过整图校验（成环 / 时间窗）。冲突全部裁决后还会在服务端写事务内重新校验。</div>`
+    : `<div class="mc-check bad">⚠ 仅自动采纳项已经导致整图校验失败（${ap.code === 'cycle' ? '成环' : '时间窗冲突'}）：${esc(ap.message || '')}
+         <button class="mc-locate" data-locate="__chain__">在画布定位冲突链</button></div>`;
+  return `<div class="mc-section-title">直接采纳（单侧修改 / 双方相同修改）</div>
+    <div class="mc-auto-item">${summary || '（无自动项）'}</div>${check}`;
+}
+
+function renderMergePlan() {
+  const plan = PP.plan;
+  if (!plan) return;
+  $('mergeMeta').innerHTML =
+    `提案 <b>#${plan.proposal_a_id} ${esc(plan.proposal_a_title)}</b> ⇄
+     <b>#${plan.proposal_b_id} ${esc(plan.proposal_b_title)}</b> ·
+     共同基线 <b>v${plan.base_version_id}</b> · 冲突 <b>${plan.conflicts.length}</b> 项`;
+
+  const conflicts = [...plan.conflicts].sort((a, b) => {
+    const rank = { delete_modify: 0, fields: 1, create_create: 2 };
+    return (rank[a.conflict_type] - rank[b.conflict_type]) || (a.id < b.id ? -1 : 1);
+  });
+  const resolvedN = conflicts.filter(isConflictResolved).length;
+  const allResolved = resolvedN === conflicts.length;
+  const body = $('mergeBody');
+  body.innerHTML = `
+    ${autoSummaryHtml(plan)}
+    <div class="mc-section-title">需要裁决的冲突（${resolvedN}/${conflicts.length}）
+      <span class="muted small">逐项选择采纳 A、B 或基线；双方新建的字段不能选基线</span></div>
+    ${conflicts.length ? conflicts.map(conflictCardHtml).join('') : '<p class="muted small">没有冲突，可直接合并。</p>'}
+    <div class="merge-footer">
+      <div class="sandbox-actions">
+        <input type="text" id="mergeMessage" maxlength="200" placeholder="合并提交说明（必填)" />
+        <button class="btn btn-primary btn-small" id="btnDoMerge" ${allResolved ? '' : 'disabled'}>
+          ${conflicts.length ? `生成合并版本（已裁决 ${resolvedN}/${conflicts.length}）` : '生成合并版本'}
+        </button>
+      </div>
+      <p class="muted small" id="mergeMsg">服务端将在 SQLite 写事务内重新合并：确认两份提案仍未使用、
+        当前版本仍等于基线 v${plan.base_version_id}，并重跑成环 / 时间窗等整图校验；任一失败都不留版本或已合并状态。</p>
+    </div>`;
+
+  body.querySelectorAll('.mc-choice button[data-key]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const key = btn.dataset.key;
+      if (PP.resolutions[key] === btn.dataset.side) delete PP.resolutions[key];
+      else PP.resolutions[key] = btn.dataset.side;
+      renderMergePlan();
+    });
+  });
+  body.querySelectorAll('.mc-choice button[data-allfields]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const entity = btn.dataset.allfields;
+      const c = conflicts.find((x) => x.id === entity);
+      for (const f of c.conflict_fields) {
+        const key = `${entity}:${f.field}`;
+        if (btn.dataset.side === 'base' && !f.resolutions.includes('base')) continue;
+        PP.resolutions[key] = btn.dataset.side;
+      }
+      renderMergePlan();
+    });
+  });
+  body.querySelectorAll('.mc-locate').forEach((btn) => btn.addEventListener('click', () => {
+    locateFromMerge(btn.dataset.locate);
+  }));
+  $('btnDoMerge')?.addEventListener('click', doMerge);
+}
+
+/** 从合并弹窗定位：优先显示合并失败整图；否则用「仅自动项」预览图定位冲突链 / 元素；
+ *  自动校验已通过时给出提示（真正的成环 / 时间窗问题只会在服务端最终合并拒绝时出现）。 */
+function locateFromMerge(target) {
+  const plan = PP.plan;
+  if (!plan) return;
+  let g, conflictData, cycle, label;
+  if (PP.lastFailGraph) {
+    g = PP.lastFailGraph;
+    conflictData = PP.lastFailConflict || null;
+    cycle = PP.lastFailCycle || null;
+    label = '合并被服务端拒绝：显示的是本次合并应用后的整图（事务已回滚，未生成版本）';
+  } else if (plan.auto_preview.graph) {
+    g = plan.auto_preview.graph;
+    conflictData = plan.auto_preview.code === 'time_conflict' ? plan.auto_preview.conflict : null;
+    cycle = plan.auto_preview.code === 'cycle' ? plan.auto_preview.cycle : null;
+    label = '自动采纳项预览图（尚未裁决的冲突按基线占位；紫色横幅可返回裁决）';
+  } else {
+    flashBanner('自动采纳项已通过整图校验；若服务端最终合并拒绝，会返回合并后整图用于定位。');
+    return;
+  }
+  closeMergeModal();
+  enterReadOnlyGraph(g, {
+    kind: 'merge-fail', label, conflictData, cycle, returnToMerge: true,
+  });
+  // 高亮具体元素（冲突链已通过 conflictData 高亮；单元素滚动选中）
+  if (target && target !== '__chain__') {
+    const isNode = S.work.nodes.has(target);
+    const isEdge = S.work.edges.has(target);
+    if (isNode) {
+      S.selected = { kind: 'node', id: target };
+    } else if (isEdge) {
+      S.selected = { kind: 'edge', id: target };
+    }
+    renderAll();
+    const elNode = isNode && nodeLayer.querySelector(`[data-node-id="${CSS.escape(target)}"]`);
+    if (elNode) elNode.scrollIntoView({ block: 'center', inline: 'center' });
+  }
+}
+
+async function doMerge() {
+  const plan = PP.plan;
+  const message = $('mergeMessage').value.trim();
+  if (!message) { $('mergeMsg').textContent = '请填写合并提交说明。'; $('mergeMsg').classList.add('error'); return; }
+  $('btnDoMerge').disabled = true;
+  const msg = $('mergeMsg');
+  msg.className = 'muted small';
+  msg.textContent = '服务端写事务合并中…';
+  try {
+    const r = await api('/api/proposals/merge', {
+      method: 'POST',
+      body: JSON.stringify({
+        proposal_a_id: plan.proposal_a_id, proposal_b_id: plan.proposal_b_id,
+        message, resolutions: PP.resolutions,
+      }),
+    });
+    closeMergeModal();
+    // 合并产生了新版本：整页状态回到新当前版（同时刷新版本列表与提案状态）
+    await loadState();
+    toast(`已生成合并版本 v${r.version_id}，提案 #${r.merged_proposal_ids.join('、#')} 均标记为已合并`);
+  } catch (err) {
+    PP.lastFailGraph = err.payload?.graph || null;
+    PP.lastFailConflict = err.payload?.conflict || null;
+    PP.lastFailCycle = err.payload?.cycle || null;
+    renderMergePlan();
+    const box = $('mergeMsg');
+    if (box) {
+      box.className = '';
+      box.classList.add('error');
+      box.innerHTML = `✘ 合并已回滚：${esc(err.message)}
+        ${PP.lastFailGraph ? ' · <a href="#" id="mergeLocateLink2" style="color:#c084fc">在画布定位整图 / 冲突链</a>' : ''}`;
+      $('mergeLocateLink2')?.addEventListener('click', (ev2) => {
+        ev2.preventDefault();
+        locateFromMerge('__chain__');
+      });
+    }
+  }
+}
+
 // ---------- Toast / 临时横幅 ----------
 
 let toastTimer;
@@ -2206,6 +2697,29 @@ function bindUI() {
   $('btnDiscard').addEventListener('click', discardChanges);
   $('commitMessage').addEventListener('input', renderHeader);
   $('btnCloseError').addEventListener('click', hideError);
+
+  // 变更提案合并
+  $('btnSaveProposal').addEventListener('click', () => { void toggleProposalSave(); });
+  $('btnProposalSaveToggle').addEventListener('click', () => { void toggleProposalSave(); });
+  $('btnDoSaveProposal').addEventListener('click', () => { void saveProposal(); });
+  $('btnProposalRefresh').addEventListener('click', () => { void loadProposals(); });
+  $('btnOpenMerge').addEventListener('click', () => { void openMergeModal(); });
+  $('btnMergeClose').addEventListener('click', closeMergeModal);
+  $('mergeModal').addEventListener('click', (ev) => {
+    if (ev.target === $('mergeModal')) closeMergeModal();
+  });
+  $('mergeSelectA').addEventListener('change', (ev) => { PP.aId = Number(ev.target.value) || null; });
+  $('mergeSelectB').addEventListener('change', (ev) => { PP.bId = Number(ev.target.value) || null; });
+  $('btnMergePreview').addEventListener('click', () => { void runMergePreview(); });
+  $('btnExitProposalView').addEventListener('click', () => { void exitReadOnlyGraph(); });
+  $('btnBackToMerge').addEventListener('click', async () => {
+    // 回到合并裁决弹窗：恢复最近一次比较结果与已做裁决（不重新发请求）
+    const plan = PP.plan, resolutions = PP.resolutions, aId = PP.aId, bId = PP.bId;
+    await loadState();  // 复位画布到当前版
+    Object.assign(PP, { plan, resolutions, aId, bId });
+    $('mergeModal').hidden = false;
+    if (plan) renderMergePlan();
+  });
 
   $('btnBackToCurrent').addEventListener('click', backToCurrent);
   $('btnRollbackView').addEventListener('click', rollbackViewing);
@@ -2269,6 +2783,7 @@ function bindUI() {
       deleteSelected();
     }
     if (ev.key === 'Escape') {
+      if (!$('mergeModal').hidden) { closeMergeModal(); return; }
       if (!$('reviewModal').hidden) { closeReviewModal(); return; }
       S.selected = null;
       renderAll();

@@ -12,6 +12,11 @@ still_active，并给出目标的递归依据树。**可复算复盘结论包**�
 每位评审人提交覆盖全部候选的严格排序，封榜前只公开已提交名单与数量、不泄露任何排序，
 封榜（写事务内校验 `session_revision` 与最低票数）后按 **Schulze 法**计算两两偏好与最强路径，
 逐层生成并列名次并公开全部选票。
+**变更提案合并**：把一组未提交修改保存为**绑定 `base_version` 的提案**（保存时只在对应基线上
+复用整图校验，不生成版本）；选择两份同基线且未合并的提案做基线 / A / B **三方比较**，
+单侧修改与双方相同修改直接采纳，字段改值冲突、删除与修改相遇逐项裁决；服务端在 SQLite
+写事务中**重新合并**（确认提案仍未使用、当前版本仍等于基线）并重跑成环 / 时间窗等整图校验，
+全部通过才生成一个 merge 版本并同时标记两份提案已合并，任一失败都不留版本或已合并状态。
 
 ## ✨ 功能特性
 
@@ -87,6 +92,22 @@ still_active，并给出目标的递归依据树。**可复算复盘结论包**�
   - **计票**：按 **Schulze 法**计算两两偏好 `d` 与最强路径 `p`，按胜出关系**逐层生成并列名次**；
     候选 ID 仅用于稳定展示，**不打断算法并列**；任意一对胜负都返回**确定性的最强路径见证**
   - 封榜后公开全部选票，名次 / 矩阵 / 见证均可在前端「评审室」弹窗中查看
+- **变更提案合并（Change Proposal Merge）**
+  - **保存提案**：把当前未提交修改保存为**绑定 `base_version`** 的提案；保存时把 changeset 应用到
+    **对应基线**并复用现有整图校验（成环 / 时间窗 / 字段语义），通过才落库，**不生成版本**；
+    基线不是最新版本也允许保存（提案始终以其基线语义参与合并）
+  - **三方比较**：选择两份**同基线且未合并**的提案，以基线 / A / B 三方逐字段比较：
+    **单侧修改、双方相同修改直接采纳**；同一字段被改成不同值（可**逐字段**裁决）、
+    删除与修改相遇（实体级裁决）列为冲突；双方新建同一 id 但取值不同也是冲突，且只能选 A / B
+  - **服务端重新合并**：裁决提交后在 SQLite 写事务（`BEGIN IMMEDIATE`）中**重新合并**：
+    再次确认两份提案**仍未使用（open）**、**当前版本等于 `base_version`**，按裁决重建 changeset
+    并再跑一遍**成环、悬空端点、时间窗**等整图校验；全部通过才插入一个 **`kind=merge`** 版本、
+    复制整图快照，并把两份提案同时置为 `merged`；**任一失败都整体回滚，不留版本、不留已合并状态**
+  - **预览与定位**：预览接口给出自动采纳清单、冲突明细与「仅自动项」的整图校验结果（含预览图）；
+    最终合并若被整图校验拒绝，错误体带**合并后整图**，前端一键进入只读视图并红色高亮成环 /
+    时间窗冲突链；每个提案也可单独只读预览（应用到其基线，不写库、不出版本）
+  - 原 `changeset` 提交、历史版本浏览与回滚**完全保持可用**；merge 版本与 commit / rollback
+    一样是不可变快照，版本列表中以紫色「合并」标签展示
 
 ## 🚀 一条命令启动
 
@@ -134,6 +155,12 @@ SQLite 数据库默认位于 `./data/app.db`，可用环境变量 `DB_PATH` 覆�
 | GET | `/api/reviews/{id}` | 评审场详情：封榜前只含已提交名单/数量，封榜后附 Schulze 结果 |
 | POST | `/api/reviews/{id}/ballots` | 提交 / 覆盖选票（登记评审人 + 全候选严格排序；封榜后 409） |
 | POST | `/api/reviews/{id}/close` | 封榜（写事务校验 `expected_revision` 与最低票数；过期/重复 409） |
+| GET | `/api/proposals` | 变更提案列表（含基线、状态与修改计数） |
+| POST | `/api/proposals` | 保存提案（绑定 `base_version`；只在该基线整图校验，不生成版本） |
+| GET | `/api/proposals/{id}` | 提案详情（含原始 changeset JSON） |
+| GET | `/api/proposals/{id}/graph` | 只读预览：提案应用到其基线后的整图（不写库、不生成版本） |
+| POST | `/api/proposals/merge-preview` | 三方比较：自动采纳项 + 冲突清单 + 仅自动项整图校验（只读） |
+| POST | `/api/proposals/merge` | 写事务内重新合并并整图校验，通过才生成 merge 版本并标记两份提案已合并 |
 | GET | `/health` | 健康检查 |
 
 交互文档：启动后访问 <http://localhost:8000/docs>。
@@ -528,21 +555,142 @@ curl -X POST http://localhost:8000/api/reviews/1/close \
 点击最强路径矩阵单元格查看该方向的见证路径。评审场只读绑定原版本快照，
 **不改写因果图、版本或结论包**。
 
+### 变更提案合并示例
+
+**保存提案**（与普通提交同一结构的 changeset；`base_version_id` 即绑定基线；
+保存时只在该基线上跑整图校验，**不生成版本**，基线不是最新版也可以）：
+
+```bash
+# 提案 A：改 n-code 标题、移动位置，并新建一个事件
+curl -X POST http://localhost:8000/api/proposals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "A 组：补充发布侧根因",
+    "changes": {
+      "base_version_id": 1,
+      "node_updates": [{"id": "n-code", "title": "错误版本发布（灰度缺失）", "pos_y": 220}],
+      "node_creates": [
+        {"id": "n-gray", "type": "event", "title": "灰度发布被跳过", "pos_x": 60, "pos_y": 60}
+      ]
+    }
+  }'
+
+# 提案 B：同一字段改成不同标题（将产生字段冲突），并单侧更新 n-loss 描述（自动采纳）
+curl -X POST http://localhost:8000/api/proposals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "title": "B 组：修订标题与损失描述",
+    "changes": {
+      "base_version_id": 1,
+      "node_updates": [
+        {"id": "n-code", "title": "错误版本发布（配置错误）"},
+        {"id": "n-loss", "description": "峰值时段约 1.5 万笔失败"}
+      ]
+    }
+  }'
+```
+
+返回的提案对象含 `id / base_version_id / status=open / counts / changes`。
+单提案只读预览（应用到基线，不写库）：
+
+```bash
+curl -s http://localhost:8000/api/proposals/1/graph | python3 -m json.tool
+```
+
+**三方比较 / 预览**（只读）：
+
+```bash
+curl -X POST http://localhost:8000/api/proposals/merge-preview \
+  -H 'Content-Type: application/json' \
+  -d '{"proposal_a_id": 1, "proposal_b_id": 2}'
+```
+
+响应（节选）：`conflicts[]` 列出必须裁决的项，每项给出基线 / A / B 三方取值与允许的裁决；
+`auto_changes` 是单侧修改 / 双方相同修改的统计；`auto_preview` 是「仅自动项」合在一起后
+的成环 / 时间窗整图校验结果（失败时附预览图 `graph`）：
+
+```json
+{
+  "proposal_a_id": 1, "proposal_b_id": 2, "base_version_id": 1,
+  "conflicts": [
+    {
+      "id": "n-code", "kind": "node", "conflict_type": "fields",
+      "conflict_fields": [
+        {"kind": "node", "field": "title",
+         "base": "错误版本发布",
+         "a": "错误版本发布（灰度缺失）", "b": "错误版本发布（配置错误）",
+         "resolutions": ["a", "b", "base"]}
+      ],
+      "base_entity": {"id": "n-code", "title": "错误版本发布", "pos_y": 200, "...": "..."},
+      "a_entity": {"id": "n-code", "title": "错误版本发布（灰度缺失）", "pos_y": 220, "...": "..."},
+      "b_entity": {"id": "n-code", "title": "错误版本发布（配置错误）", "pos_y": 200, "...": "..."}
+    }
+  ],
+  "auto_changes": {"changes": {"node_creates": 1, "node_updates": 1, "...": 0}},
+  "auto_preview": {"ok": true, "code": null, "cycle": null, "conflict": null, "graph": null}
+}
+```
+
+冲突类型与裁决键：
+
+| conflict_type | 含义 | 裁决键（`resolutions`） | 可选值 |
+| --- | --- | --- | --- |
+| `fields` | 双方都改了同一字段且取值不同 | 可逐字段 `"<id>:<field>"`，也可整体 `"<id>"` | `a` / `b` / `base` |
+| `create_create` | 双方新建同一 id 但字段取值不同 | 同上，逐字段 | **仅** `a` / `b`（基线无该实体） |
+| `delete_modify` | 一方删除、另一方保留 / 修改（含被删节点的关联边） | `"<id>"` | 删除侧 / 保留侧 / `base` |
+
+**合并**：写事务内重新加载两份提案与基线，确认两者仍 `open` 且当前最新版本仍为
+`base_version`，按裁决重建一个 changeset 并复用 `apply_changes` 整图校验，通过后才生成
+`kind=merge` 版本并同时标记两份提案 `merged`：
+
+```bash
+curl -X POST http://localhost:8000/api/proposals/merge \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "proposal_a_id": 1,
+    "proposal_b_id": 2,
+    "message": "合并 A/B 两组根因修订",
+    "resolutions": {
+      "n-code:title": "a",
+      "n-code:pos_y": "b"
+    }
+  }'
+```
+
+```json
+{
+  "version_id": 3, "kind": "merge", "message": "合并 A/B 两组根因修订",
+  "created_at": "2026-09-30T…", "merged_proposal_ids": [1, 2]
+}
+```
+
+- 有冲突未裁决 / 裁决键非法 → **400**（`unresolved_conflict` / `invalid_resolution`），不落库；
+- 任一提案已合并 → **409** `proposal_already_merged`；两份提案基线不同 → **400**
+  `different_base`；当前版本已不等于基线（期间有新提交 / 回滚）→ **409** `stale_version`；
+- 合并后的图**成环 / 时间窗冲突 / 悬空端点 / 类型非法** → **400**，结构与普通提交一致
+  （`code=cycle|time_conflict|...`、`cycle` / `conflict`），并额外携带**合并后整图** `graph`
+  供前端红色高亮定位；事务已回滚 —— **没有新版本，两份提案仍为 open，可调整裁决后重试**。
+
+前端在右侧「变更提案合并」面板：顶栏「存为提案…」或面板内保存当前未提交修改；点击提案名
+可只读预览；「合并两份提案…」打开弹窗，逐项选择 A / B / 基线（字段可逐字段、也可一键同侧），
+自动采纳统计与整图校验结果实时展示，「在画布定位」用只读预览图 / 合并失败整图高亮冲突链。
+
 ## 🏗️ 架构与目录
 
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：提交事务、回滚、下游查询、反事实推演、结论包导出/核验、盲评建场/投票/封榜、静态托管
-│   ├── graph.py      # 图加载、changeset 校验（成环检测/证据字段）、时间窗传播、证据强度审查、BFS 下游、反事实拓扑推演、快照持久化
+│   ├── main.py       # FastAPI 路由：提交事务、回滚、下游查询、反事实推演、结论包导出/核验、盲评建场/投票/封榜、提案保存/预览/合并、静态托管
+│   ├── graph.py      # 图加载、changeset 校验（成环检测/证据字段）、时间窗传播、证据强度审查、BFS 下游、反事实拓扑推演、快照持久化、失败整图捕获
 │   ├── conclusion.py # 可复算复盘结论包：自包含 payload 收集、规范化 SHA-256 摘要、上传包重建 DAG 重算并逐字段比对（纯只读）
 │   ├── review.py     # 根因共识盲评：评审场 CRUD（写事务校验 revision/最低票数）、Schulze 计票（两两偏好/最强路径/逐层并列/确定性见证）
-│   ├── database.py   # SQLite 连接、表结构、v1 示例数据
+│   ├── proposal.py   # 变更提案合并：提案存取（绑定基线、不出版本）、基线/A/B 三方比较、逐项裁决、写事务内重新合并与整图校验
+│   ├── database.py   # SQLite 连接、表结构、v1 示例数据、旧库幂等迁移（时间/证据/trigger_mode/edges CHECK/versions merge CHECK）
 │   └── schemas.py    # Pydantic 请求/响应模型
 ├── static/
-│   ├── index.html    # 三栏布局：顶栏 / 画布 / 侧栏 + 评审室弹窗
+│   ├── index.html    # 三栏布局：顶栏 / 画布 / 侧栏 + 评审室弹窗 + 提案合并弹窗
 │   ├── style.css
-│   └── app.js        # 状态管理、SVG 渲染、拖拽/连线、changeset 累计与提交、结论包导出下载与核验展示、盲评建场/投票/封榜与矩阵视图
+│   └── app.js        # 状态管理、SVG 渲染、拖拽/连线、changeset 累计与提交、结论包、盲评、提案保存/预览/三方裁决/冲突定位
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
@@ -550,7 +698,7 @@ curl -X POST http://localhost:8000/api/reviews/1/close \
 
 ### 数据模型（版本即快照）
 
-- `versions(id, message, kind[commit|rollback], base_id, created_at)`
+- `versions(id, message, kind[commit|rollback|merge], base_id, created_at)`
 - `nodes(id, version_id, type, title, description, pos_x, pos_y, earliest_time, latest_time,
   reliability, source_group, trigger_mode, created_at)`，主键 `(id, version_id)`；
   `earliest_time` / `latest_time` 为 UTC（`...Z`），仅事件节点非空；
@@ -558,6 +706,11 @@ curl -X POST http://localhost:8000/api/reviews/1/close \
   `trigger_mode ∈ {ANY, ALL}` 仅事件节点非空（证据节点恒为 NULL）
 - `edges(id, version_id, source_id, target_id, kind, label, created_at)`，主键 `(id, version_id)`；
   `kind ∈ {causes, supports, refutes}`
+- 变更提案合并（提案独立于最新版本，始终绑定其基线）：
+  - `change_proposals(id, title, base_version_id→versions, changes_json[JSON=Changeset],
+    status[open|merged], merged_into→versions, created_at, merged_at)`；
+    保存只写提案不写 versions，合并成功才写一个 `kind='merge'` 版本并把两份提案置为
+    `merged / merged_into`（同事务原子完成）
 - 根因共识盲评（只读写以下表，不触碰上面的图数据）：
   - `review_sessions(id, title, version_id→versions, min_votes, status[open|closed],
     revision, created_at, closed_at)` —— `revision` 即 `session_revision`，每次投票 / 封榜自增
@@ -566,9 +719,11 @@ curl -X POST http://localhost:8000/api/reviews/1/close \
     `ranking` 为 JSON 数组（全部候选的严格排序），重复提交即覆盖
 
 最新版本 = `MAX(versions.id)`；读取图时只查该版本的行。回滚不修改任何旧行，而是把目标版本的
-nodes/edges 复制到一条新的 rollback 版本中，因此历史始终可追溯。旧版数据库启动时会幂等
-`ALTER TABLE` 补齐时间列、证据强度列与 `trigger_mode` 列（历史事件行回填默认 `ANY`），并重建
-edges 表把 CHECK 约束扩展到 `refutes`（历史行原样复制）。
+nodes/edges 复制到一条新的 rollback 版本中，因此历史始终可追溯。提案合并同理：合并版本是一条
+`kind='merge'`、`base_id=提案共同基线` 的新快照，两份提案在同事务内标记为 `merged`。旧版数据库
+启动时会幂等 `ALTER TABLE` 补齐时间列、证据强度列与 `trigger_mode` 列（历史事件行回填默认 `ANY`），
+并重建 edges / versions 表把 CHECK 约束分别扩展到 `refutes` 与 `merge`（历史行原样复制，
+AUTOINCREMENT 计数器保留）。
 
 ### 事务校验流程（`graph.apply_changes`）
 
@@ -630,7 +785,36 @@ edges 表把 CHECK 约束扩展到 `refutes`（历史行原样复制）。
 5. **见证**：对任意 `p[i][j] > 0` 的方向，在「`d[u][v] > d[v][u]` 且 `d[u][v] ≥ p[i][j]`」
    的子图上按候选 ID 升序 DFS 取第一条路径 —— 其最弱边恰为 `p[i][j]`，确定性可复现
 
+### 变更提案合并（`proposal.save_proposal` / `build_merge_plan` / `merge_proposals`）
+
+1. **保存**：校验标题与非空 changeset、基线版本存在；在**该基线**（不要求是最新版）上调用
+   `apply_changes` 复用整图校验，通过后在一个短写事务内写入 `change_proposals`
+   （`changes_json` 只含显式提供字段，时间统一 UTC `...Z`），**不插入 versions**
+2. **三方比较**：分别把两份提案应用到共同基线，投影为节点 / 连线字段字典；对每个实体按
+   「基线有无 × A 有无 × B 有无」分类：
+   - 单侧新建 / 单侧修改 / 单侧删除（另一侧未动）、双方相同修改 → **自动采纳**；
+   - 双方都存在且同字段改成不同值 → `fields` 冲突（未冲突字段仍自动合并）；
+   - 双方新建同 id 但取值不同 → `create_create`（只能选 A/B）；
+   - 一方删除、另一方保留（含指向被删节点的新建边）→ `delete_modify`，关联边归入节点裁决；
+   - 双方都删节点的关联边自动级联，不重复要求裁决
+3. **预览校验**：把「仅自动项 + 未裁决冲突的基线占位」组成临时图，直接跑
+   `find_cycle` / `compute_time_windows`（无持久化），失败时随预览返回整图
+4. **写事务合并**（`BEGIN IMMEDIATE`，全部在同一事务）：
+   - 两份提案都必须仍 `open` 且基线相同；`MAX(versions.id)` 必须仍等于 `base_version`
+     （否则 409 `stale_version`，前端可刷新后重新比较 / 裁决）；
+   - 在事务内**重新做一遍**三方比较与组成（不信任预览时的旧状态），按裁决
+     `"<id>"` 或逐字段 `"<id>:<field>"` 重建一个等价 changeset，对基线求差后调用
+     **同一个** `apply_changes`（`capture_partial=True`）—— 成环 / 时间窗 / 悬空端点 /
+     类型 / 平行边等整图校验与普通提交完全一致；
+   - 全部通过才插入 `kind='merge'` 版本 + 快照行，并把两份提案更新为
+     `status='merged', merged_into=新版本`；任一步抛错 → `ROLLBACK`，版本与已合并状态都不留，
+     错误体携带合并后整图用于前端定位
+
 ## 📌 说明
 
 - 节点 / 连线 id 由客户端生成（`[A-Za-z0-9_-]+`），便于一次批次中同时「创建并连边」。
-- 并发安全：提交使用 `BEGIN IMMEDIATE` 写锁 + 基准版本乐观校验，后提交者会收到 `stale_version` 错误。
+- 并发安全：提交使用 `BEGIN IMMEDIATE` 写锁 + 基准版本乐观校验，后提交者会收到 `stale_version` 错误；
+  提案合并在写事务内同时校验「两份提案仍 open」与「当前版本仍等于 `base_version`」，
+  期间任何提交 / 回滚 / 其他合并都会使本次合并返回 409，且不产生任何副作用。
+- 提案不改变图：保存提案只写 `change_proposals`，不生成版本；只有裁决后的合并成功才产生一个
+  merge 版本。提案合并后不会被删除（保留 `merged_into` 供审计），但不能再次参与合并。

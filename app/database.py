@@ -19,7 +19,7 @@ PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS versions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     message     TEXT NOT NULL,
-    kind        TEXT NOT NULL CHECK (kind IN ('commit', 'rollback')),
+    kind        TEXT NOT NULL CHECK (kind IN ('commit', 'rollback', 'merge')),
     base_id     INTEGER REFERENCES versions(id),
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS review_ballots (
     submitted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY (session_id, reviewer)
 );
+
+-- 变更提案合并：把一组未提交修改保存为「绑定 base_version 的提案」。
+-- 保存提案只在对应基线上做整图校验、不生成版本；两份同基线且未合并的提案
+-- 经三方合并与逐项裁决后，在写事务内重新合并并复用整图校验，全部通过才生成一个
+-- merge 版本并同时把两份提案标记为已合并。
+CREATE TABLE IF NOT EXISTS change_proposals (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT NOT NULL,
+    base_version INTEGER NOT NULL REFERENCES versions(id),
+    changes_json TEXT NOT NULL CHECK (json_valid(changes_json)),  -- 与 Changeset 同构（仅含显式提供字段）
+    status       TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'merged')),
+    merged_into  INTEGER REFERENCES versions(id),  -- 合并提交生成的版本 id（已合并时非空）
+    created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    merged_at    TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_base ON change_proposals(base_version);
 """
 
 # (id, type, title, desc, x, y, earliest_time_utc, latest_time_utc, reliability, source_group, trigger_mode)
@@ -147,6 +164,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     _migrate_evidence_columns(conn)
     _migrate_trigger_mode(conn)
     _migrate_edge_kinds(conn)
+    _migrate_version_kinds(conn)
     count = conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
     if count == 0:
         cur = conn.execute(
@@ -223,3 +241,41 @@ def _migrate_edge_kinds(conn: sqlite3.Connection) -> None:
         ALTER TABLE edges_new RENAME TO edges;
         CREATE INDEX IF NOT EXISTS idx_edges_version ON edges(version_id);
     """)
+
+
+def _migrate_version_kinds(conn: sqlite3.Connection) -> None:
+    """旧库 versions.kind 的 CHECK 不含 'merge'；SQLite 不能改 CHECK，按官方方式重建表。
+
+    幂等：检测建表 SQL 中已含 'merge' 则跳过；历史行原样复制，不改写任何数据。
+    """
+    row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'").fetchone()
+    if row is None or "'merge'" in (row["sql"] or ""):
+        return
+    # AUTOINCREMENT 依赖 sqlite_sequence；重建表时保留其计数器，使新版本 id 继续递增。
+    # 复制期间临时关闭外键：SQLite 重建被引用表时，PRAGMA legacy_alter_table 是官方推荐做法。
+    row_seq = conn.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name = 'versions'"
+    ).fetchone()
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.executescript("""
+            CREATE TABLE versions_new (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                message     TEXT NOT NULL,
+                kind        TEXT NOT NULL CHECK (kind IN ('commit', 'rollback', 'merge')),
+                base_id     INTEGER REFERENCES versions(id),
+                created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+            );
+            INSERT INTO versions_new (id, message, kind, base_id, created_at)
+                SELECT id, message, kind, base_id, created_at FROM versions;
+            DROP TABLE versions;
+            ALTER TABLE versions_new RENAME TO versions;
+        """)
+        if row_seq is not None:
+            conn.execute(
+                "INSERT OR REPLACE INTO sqlite_sequence(name, seq) VALUES ('versions', ?)",
+                (row_seq[0],),
+            )
+    finally:
+        # 同连接内重新打开外键；外键约束不会在 DDL 中途校验历史行
+        conn.execute("PRAGMA foreign_keys = ON")

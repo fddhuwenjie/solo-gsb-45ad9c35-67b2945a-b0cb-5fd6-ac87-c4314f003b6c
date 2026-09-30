@@ -18,14 +18,19 @@ class GraphError(Exception):
         self,
         message: str,
         code: str = "invalid",
+        status_code: int | None = None,
         cycle: list[str] | None = None,
         conflict: dict[str, Any] | None = None,
+        graph: Graph | None = None,
     ):
         super().__init__(message)
         self.message = message
         self.code = code
+        self.status_code = status_code
         self.cycle = cycle
         self.conflict = conflict
+        # 可选：校验失败时「应用到中途」的图（合并整图校验失败时随错误返回，供前端定位）
+        self.graph = graph
 
 
 @dataclass
@@ -99,7 +104,25 @@ def _norm_source_group(group: str | None) -> str | None:
     return g or None
 
 
-def apply_changes(graph: Graph, changes: Changeset) -> tuple[dict[str, Node], dict[str, Edge]]:
+def apply_changes(graph: Graph, changes: Changeset, *, capture_partial: bool = False
+                  ) -> tuple[dict[str, Node], dict[str, Edge]]:
+    """在 graph 副本上应用 changes，全部校验通过后返回新的 nodes/edges。
+
+    失败统一抛 GraphError，调用方负责回滚。capture_partial=True 时，失败的异常会
+    附带一张「尽力应用后的图」：成环 / 时间窗等整图校验失败时它就是应用后的整图，
+    供合并失败时把冲突定位给前端（不影响事务回滚，库中不留任何内容）。
+    """
+    if not capture_partial:
+        return _apply_changes_impl(graph, changes)
+    try:
+        return _apply_changes_impl(graph, changes)
+    except GraphError as exc:
+        if exc.graph is None:
+            exc.graph = partial_after_apply(graph, changes)
+        raise
+
+
+def _apply_changes_impl(graph: Graph, changes: Changeset) -> tuple[dict[str, Node], dict[str, Edge]]:
     """在 graph 副本上应用 changes，全部校验通过后返回新的 nodes/edges。
 
     失败统一抛 GraphError，调用方负责回滚。
@@ -260,6 +283,81 @@ def apply_changes(graph: Graph, changes: Changeset) -> tuple[dict[str, Node], di
         raise GraphError(_conflict_message(nodes, conflict), "time_conflict", conflict=conflict)
 
     return nodes, edges
+
+
+def partial_after_apply(graph: Graph, changes: Changeset) -> Graph:
+    """尽力把 changes 应用到 graph 副本，跳过结构校验（存在 / 重复 / 类型 / 平行边），
+    但仍执行字段更新与时间换算。仅用于失败时返回定位用的「应用后整图」，结果绝不入库。
+    """
+    nodes: dict[str, Node] = dict(graph.nodes)
+    edges: dict[str, Edge] = dict(graph.edges)
+
+    deleted_nodes: set[str] = set()
+    for nid in changes.node_deletes:
+        if nid in nodes:
+            deleted_nodes.add(nid)
+            nodes.pop(nid, None)
+    cascade = {eid for eid, e in edges.items() if e.source_id in deleted_nodes or e.target_id in deleted_nodes}
+    for eid in cascade:
+        edges.pop(eid, None)
+    for eid in changes.edge_deletes:
+        edges.pop(eid, None)
+
+    for upd in changes.node_updates:
+        if upd.id in deleted_nodes:
+            continue
+        node = nodes.get(upd.id)
+        if node is None:
+            continue
+        earliest, latest = node.earliest_time, node.latest_time
+        reliability, source_group = node.reliability, node.source_group
+        trigger_mode = node.trigger_mode
+        provided = upd.model_fields_set
+        if "earliest_time" in provided:
+            earliest = to_utc_iso(upd.earliest_time) if upd.earliest_time is not None else None
+        if "latest_time" in provided:
+            latest = to_utc_iso(upd.latest_time) if upd.latest_time is not None else None
+        if "reliability" in provided:
+            reliability = upd.reliability
+        if "source_group" in provided:
+            source_group = _norm_source_group(upd.source_group)
+        if "trigger_mode" in provided:
+            trigger_mode = upd.trigger_mode or "ANY"
+        nodes[upd.id] = Node(
+            id=node.id, type=node.type,
+            title=upd.title if upd.title is not None else node.title,
+            description=upd.description if upd.description is not None else node.description,
+            pos_x=upd.pos_x if upd.pos_x is not None else node.pos_x,
+            pos_y=upd.pos_y if upd.pos_y is not None else node.pos_y,
+            created_at=node.created_at,
+            earliest_time=earliest, latest_time=latest,
+            reliability=reliability, source_group=source_group, trigger_mode=trigger_mode,
+        )
+
+    for cr in changes.node_creates:
+        nodes[cr.id] = Node(
+            id=cr.id, type=cr.type, title=cr.title, description=cr.description,
+            pos_x=cr.pos_x, pos_y=cr.pos_y, created_at="",
+            earliest_time=to_utc_iso(cr.earliest_time) if cr.earliest_time is not None else None,
+            latest_time=to_utc_iso(cr.latest_time) if cr.latest_time is not None else None,
+            reliability=cr.reliability, source_group=_norm_source_group(cr.source_group),
+            trigger_mode=cr.trigger_mode or "ANY",
+        )
+
+    for upd in changes.edge_updates:
+        edge = edges.get(upd.id)
+        if edge is None:
+            continue
+        kind = edge.kind
+        if upd.kind is not None:
+            kind = upd.kind
+        edges[upd.id] = Edge(edge.id, edge.source_id, edge.target_id, kind,
+                             upd.label if upd.label is not None else edge.label, edge.created_at)
+
+    for cr in changes.edge_creates:
+        edges[cr.id] = Edge(cr.id, cr.source_id, cr.target_id, cr.kind, cr.label, created_at="")
+
+    return Graph(graph.version_id, nodes, edges)
 
 
 def find_cycle(nodes: dict[str, Node], edges: dict[str, Edge]) -> list[str] | None:
