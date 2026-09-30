@@ -28,6 +28,7 @@
   <div class="banner-viewing" id="viewBanner" hidden>
     <span id="viewBannerText"></span>
     <button class="btn btn-small" id="btnBackToCurrent">返回当前版</button>
+    <button class="btn btn-small btn-primary" id="btnBackToMerge" hidden>返回裁决</button>
     <button class="btn btn-small btn-warn" id="btnRollbackView">以此版本回滚</button>
   </div>
 
@@ -188,6 +189,27 @@
         <ul class="review-list" id="reviewList"></ul>
       </div>
 
+      <div class="panel" id="proposalPanel">
+        <h3>变更提案合并</h3>
+        <p class="muted small">
+          把未提交修改保存为<b>绑定基线版本</b>的提案：保存时只在对应基线上复用整图校验，
+          <b>不生成版本</b>。勾选两份<b>同基线、未合并</b>的提案做三方比较：
+          单侧修改与双方相同修改直接采纳；同字段改成不同值、删除与修改相遇列为冲突，
+          逐项裁决（A / B / 基线 / 丢弃）后服务端在写事务中重合并并重跑成环、时间窗等校验，
+          全通过才生成一个<b>合并版本</b>并同时标记两份提案已合并。
+        </p>
+        <div class="detail-row">
+          <input type="text" id="ppTitle" maxlength="200" placeholder="提案标题，如：A 组补充监控证据" />
+        </div>
+        <div class="sandbox-actions">
+          <button class="btn btn-small btn-primary" id="btnPpSave">保存当前修改为提案</button>
+          <button class="btn btn-small" id="btnPpRefresh">刷新</button>
+        </div>
+        <button class="btn btn-small btn-block" id="btnPpMerge" disabled>勾选两份提案后比较（已选 0/2）</button>
+        <p class="muted small" id="ppSaveMsg"></p>
+        <ul class="review-list" id="proposalList"></ul>
+      </div>
+
       <div class="panel panel-grow" id="versionsPanel">
         <h3>版本快照</h3>
         <button class="btn btn-small btn-refresh" id="btnRefreshVersions">刷新</button>
@@ -209,6 +231,35 @@
         <button class="seg-btn" data-rtab="matrix">两两矩阵</button>
       </div>
       <div class="review-body" id="reviewBody"></div>
+    </div>
+  </div>
+
+  <div class="review-modal" id="mergeModal" hidden>
+    <div class="review-dialog merge-dialog">
+      <header class="review-head">
+        <span id="mergeModalTitle">三方合并裁决</span>
+        <button class="banner-close" id="btnMergeClose">×</button>
+      </header>
+      <div class="review-meta" id="mergeMeta"></div>
+      <div class="merge-warnings" id="mergeWarnings"></div>
+      <div class="merge-columns">
+        <div class="merge-col">
+          <div class="window-title">自动采纳（<span id="mergeAutoCount">0</span>）</div>
+          <div id="mergeAuto" class="merge-list"></div>
+        </div>
+        <div class="merge-col">
+          <div class="window-title">冲突裁决（<span id="mergeConflictCount">0</span>，逐项必选）</div>
+          <div id="mergeConflicts" class="merge-list"></div>
+        </div>
+      </div>
+      <div class="merge-footer">
+        <input type="text" id="mergeMessage" maxlength="200" placeholder="合并版本说明（必填）" />
+        <div class="sandbox-actions" style="margin-bottom:0">
+          <button class="btn btn-small" id="btnMergePreview">预览合并结果</button>
+          <button class="btn btn-small btn-primary" id="btnMergeCommit">裁决并生成合并版本</button>
+        </div>
+        <p class="muted small" id="mergeMsg"></p>
+      </div>
     </div>
   </div>
 

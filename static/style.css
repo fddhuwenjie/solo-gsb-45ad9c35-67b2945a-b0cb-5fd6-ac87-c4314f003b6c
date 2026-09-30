@@ -292,6 +292,7 @@ textarea { resize: vertical; width: 100%; }
 .tag { font-size: 10px; padding: 0 6px; border-radius: 8px; }
 .tag.commit { background: rgba(56,189,248,.15); color: var(--accent); }
 .tag.rollback { background: rgba(251,191,36,.15); color: var(--evidence); }
+.tag.merge { background: rgba(192,132,252,.18); color: #c084fc; border: 1px solid rgba(192,132,252,.4); }
 .tag.current { background: rgba(74,222,128,.15); color: var(--ok); }
 
 /* ---------- 影响结果 ---------- */
@@ -497,3 +498,63 @@ textarea { resize: vertical; width: 100%; }
   background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
   padding: 8px 10px; margin-top: 6px; font-size: 11px; line-height: 1.7;
 }
+
+/* ---------- 变更提案合并 ---------- */
+#proposalPanel { border-top: 2px solid rgba(192, 132, 252, 0.35); }
+#ppTitle { width: 100%; margin-bottom: 6px; }
+.proposal-item.merged { opacity: .62; }
+.proposal-item .pp-pick { display: flex; align-items: center; gap: 6px; cursor: pointer; font-weight: 600; }
+.proposal-item .pp-pick input { margin: 0; accent-color: #c084fc; }
+.muted.small.err, #mergeMsg.err { color: #fca5a5; }
+
+/* 画布上的合并冲突定位高亮 */
+.node.merge-hit .node-rect {
+  stroke: #c084fc; stroke-width: 3.5; stroke-dasharray: 9 3;
+  fill: rgba(192, 132, 252, 0.14);
+}
+.edge.merge-hit .edge-path { stroke: #c084fc; stroke-width: 3.5; stroke-dasharray: none; }
+.node.merge-hit.conflict-hit .node-rect,
+.edge.merge-hit.conflict-hit .edge-path { stroke: var(--danger); }
+
+.merge-dialog { width: min(920px, 96vw); }
+.merge-side { font-weight: 600; }
+.merge-side.side-a { color: var(--ok); }
+.merge-side.side-b { color: var(--accent); }
+.merge-warn {
+  color: #fde68a; background: rgba(251,191,36,.1);
+  border: 1px solid rgba(251,191,36,.45); border-radius: 6px;
+  padding: 5px 9px; margin: 5px 0; font-size: 11px; line-height: 1.6;
+}
+.merge-columns { display: flex; gap: 12px; }
+.merge-col { flex: 1; min-width: 0; }
+.merge-list {
+  max-height: 46vh; overflow-y: auto; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px;
+}
+.merge-row {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; margin-bottom: 6px; font-size: 11px; line-height: 1.5;
+}
+.merge-row.auto { background: rgba(148,163,184,.06); }
+.merge-kind {
+  display: inline-block; font-size: 10px; padding: 0 6px; border-radius: 8px;
+  background: var(--bg-panel-2); color: var(--text-dim); margin-right: 6px;
+}
+.merge-name { color: var(--text); }
+.merge-side-tag { font-size: 10px; font-weight: 700; padding: 0 6px; border-radius: 8px; margin-left: 4px; }
+.merge-side-tag.side-a, .cf-choice.side-a { color: var(--ok); }
+.merge-side-tag.side-b, .cf-choice.side-b { color: var(--accent); }
+.merge-side-tag.side-base, .cf-choice.side-base { color: var(--text-dim); }
+.merge-side-tag.side-both, .cf-choice.side-drop { color: #c084fc; }
+.merge-row.conflict { border-color: rgba(251,191,36,.5); background: rgba(251,191,36,.05); }
+.cf-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.cf-options { margin-top: 5px; display: flex; flex-direction: column; gap: 3px; }
+.cf-choice {
+  display: flex; align-items: baseline; gap: 6px; padding: 3px 6px;
+  border-radius: 5px; cursor: pointer; background: var(--bg-panel);
+}
+.cf-choice:hover { outline: 1px solid var(--border); }
+.cf-choice input { margin: 0; }
+.cf-val { color: var(--text-dim); font-size: 10px; word-break: break-all; }
+.merge-footer { border-top: 1px solid var(--border); margin-top: 10px; padding-top: 10px; }
+#mergeMessage { width: 100%; margin-bottom: 6px; }

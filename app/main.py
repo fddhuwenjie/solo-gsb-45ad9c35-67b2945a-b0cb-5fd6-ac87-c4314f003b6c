@@ -11,10 +11,13 @@ from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from app import conclusion, database, graph, review
+from app import conclusion, database, graph, proposals, review
 from app.schemas import (
     CommitRequest,
     CounterfactualRequest,
+    MergeCommitRequest,
+    MergePreviewRequest,
+    ProposalSaveRequest,
     ReviewBallotRequest,
     ReviewCloseRequest,
     ReviewCreateRequest,
@@ -62,6 +65,15 @@ async def review_error_handler(request: Request, exc: review.ReviewError) -> JSO
     )
 
 
+@app.exception_handler(proposals.ProposalError)
+async def proposal_error_handler(request: Request, exc: proposals.ProposalError) -> JSONResponse:
+    # 提案已合并 / 裁决过期等状态冲突为 409；保存 / 合并中的整图校验错误仍走 GraphError
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.message, "code": exc.code},
+    )
+
+
 # ---------- 序列化 ----------
 
 def node_dict(n: graph.Node, windows: dict | None = None, reviews: dict | None = None) -> dict[str, Any]:
@@ -99,6 +111,8 @@ def graph_dict(g: graph.Graph) -> dict[str, Any]:
 def version_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
     node_count = conn.execute("SELECT COUNT(*) FROM nodes WHERE version_id = ?", (row["id"],)).fetchone()[0]
     edge_count = conn.execute("SELECT COUNT(*) FROM edges WHERE version_id = ?", (row["id"],)).fetchone()[0]
+    merged_ids = [r[0] for r in conn.execute(
+        "SELECT id FROM proposals WHERE merged_version_id = ? ORDER BY id", (row["id"],))]
     return {
         "id": row["id"],
         "message": row["message"],
@@ -107,6 +121,7 @@ def version_dict(conn: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
         "created_at": row["created_at"],
         "node_count": node_count,
         "edge_count": edge_count,
+        "merged_proposal_ids": merged_ids,
     }
 
 
@@ -314,6 +329,59 @@ def rollback(body: RollbackRequest, conn: sqlite3.Connection = Depends(get_conn)
     row = conn.execute("SELECT * FROM versions WHERE id = ?", (new_id,)).fetchone()
     return {"version_id": new_id, "message": message, "created_at": row["created_at"],
             "restored_from": body.target_version_id}
+
+
+# ---------- 变更提案：保存（不生成版本）/ 预览 / 三方合并 ----------
+
+@app.get("/api/proposals")
+def list_change_proposals(conn: sqlite3.Connection = Depends(get_conn)):
+    return {"proposals": proposals.list_proposals(conn)}
+
+
+@app.post("/api/proposals", status_code=201)
+def save_change_proposal(body: ProposalSaveRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """把一组未提交修改保存为绑定 base_version_id 的提案。
+
+    保存时在对应基线上复用 graph.apply_changes 整图校验，只写 proposals 表，不生成版本。
+    """
+    ch = body.changes
+    if not any([ch.node_creates, ch.node_updates, ch.node_deletes,
+                ch.edge_creates, ch.edge_updates, ch.edge_deletes]):
+        raise GraphError("没有任何可保存的修改", "empty_changeset")
+    return proposals.save_proposal(conn, title=body.title, changes=ch)
+
+
+@app.get("/api/proposals/{proposal_id}")
+def get_change_proposal(proposal_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    return proposals.get_proposal(conn, proposal_id)
+
+
+@app.get("/api/proposals/{proposal_id}/preview")
+def preview_change_proposal(proposal_id: int, conn: sqlite3.Connection = Depends(get_conn)):
+    """单提案只读预览：返回基线图与「应用该提案后」的完整图（不写库、不生成版本）。"""
+    info, base, applied = proposals.proposal_graphs(conn, proposal_id)
+    return {
+        "proposal": info,
+        "base_version_id": info["base_version_id"],
+        "base_graph": graph_dict(base),
+        "graph": graph_dict(applied),
+    }
+
+
+@app.post("/api/proposals/merge-preview")
+def preview_proposal_merge(body: MergePreviewRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """三方比较（只读）：基线 / 提案 A / 提案 B，列出自动采纳项、冲突与合并预览图。"""
+    result = proposals.preview_merge(conn, body)
+    merged_graph = result.pop("merged")
+    result["merged_graph_full"] = graph_dict(merged_graph)
+    return result
+
+
+@app.post("/api/proposals/merge")
+def merge_proposals(body: MergeCommitRequest, conn: sqlite3.Connection = Depends(get_conn)):
+    """按逐项裁决在写事务中重新合并：复查提案状态与基线版本、重跑整图校验，
+    全部通过才生成一个 merge 版本并同时标记两份提案已合并；任一失败全部回滚。"""
+    return proposals.commit_merge(conn, body)
 
 
 # 静态前端（API 路由先注册，未匹配的路径交给 StaticFiles）

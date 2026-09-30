@@ -17,6 +17,8 @@ const S = {
   view: { x: 40, y: 30, k: 1 },
   addType: 'event',
   viewingVersion: null,   // 非 null 时处于只读历史浏览
+  preview: null,          // 非 null 时处于提案只读预览 {kind:'proposal'|'merge', ...}
+  mergeHits: { nodes: new Set(), edges: new Set() },  // 合并冲突定位高亮
   affected: { nodes: new Set(), edges: new Set() },
   conflictHits: { nodes: new Set(), edges: new Set(), data: null },  // 服务端返回的时间窗冲突链
   localConflictHits: { nodes: new Set(), edges: new Set(), data: null },  // 未提交工作图上的即时冲突
@@ -44,7 +46,7 @@ function normalizeNode(n) {
 }
 
 function recomputeLocalConflict() {
-  if (S.viewingVersion || !S.work) { S.localConflictHits = emptyHits(); return; }
+  if (isReadOnly() || !S.work) { S.localConflictHits = emptyHits(); return; }
   const { conflict } = computeTimeWindows(S.work.nodes, S.work.edges);
   S.localConflictHits = conflict
     ? { nodes: new Set(conflict.chain_node_ids), edges: new Set(conflict.chain_edge_ids), data: conflict }
@@ -55,6 +57,11 @@ function newChangeSet() {
   return { node_creates: [], node_updates: [], node_deletes: [],
            edge_creates: [], edge_updates: [], edge_deletes: [] };
 }
+
+// 只读模式：历史版本浏览，或提案 / 合并结果预览
+const isReadOnly = () => !!S.viewingVersion || !!S.preview;
+// 本地脏工作图（非只读且有未提交修改）——时间窗 / 证据审查 / 沙盘据此走前端同构重算
+const isDirtyEditing = () => !isReadOnly() && changeCount() > 0;
 
 // ---------- 时间窗工具 ----------
 // 线与存储统一为 UTC（...Z）；用户可输入任意带时区偏移的 ISO 8601，空串表示不限。
@@ -129,12 +136,15 @@ async function loadState() {
   S.changes = newChangeSet();
   S.selected = null;
   S.viewingVersion = null;
+  S.preview = null;
+  S.mergeHits = { nodes: new Set(), edges: new Set() };
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
   clearAffected();
   resetSandbox();
   renderAll();
   await refreshVersions();
   void loadReviews();
+  void loadProposals();
 }
 
 // ---------- changeset 记账 ----------
@@ -248,7 +258,7 @@ function moveNodeLocal(id, x, y) {
 }
 
 function deleteSelected() {
-  if (!S.selected || S.viewingVersion) return;
+  if (!S.selected || isReadOnly()) return;
   if (S.selected.kind === 'node') {
     stageNodeDelete(S.selected.id);
     // 同步工作图（级联删边）
@@ -418,10 +428,10 @@ function currentTimeInfo() {
 function eventWindowFor(nodeId) {
   const n = S.work.nodes.get(nodeId);
   if (!n || n.type !== 'event') return null;
-  if (S.viewingVersion || changeCount() === 0) {
-    return n.time_window || null;  // 服务端已按所查看版本重算
+  if (isDirtyEditing()) {
+    return currentTimeInfo().windows.get(nodeId) || null;
   }
-  return currentTimeInfo().windows.get(nodeId) || null;
+  return n.time_window || null;  // 历史版本 / 提案预览均由服务端按所看图重算
 }
 
 // ---------- 证据强度审查（与后端 graph.compute_evidence_review 同构） ----------
@@ -512,7 +522,7 @@ function applyView() {
 function renderAll() {
   recomputeLocalConflict();
   // 未提交工作图：证据强度审查实时重算；干净视图 / 历史快照用服务端按各自版本算好的结果
-  S.localReviews = (!S.viewingVersion && changeCount() > 0)
+  S.localReviews = isDirtyEditing()
     ? computeEvidenceReview(S.work.nodes, S.work.edges) : null;
   // 先同步沙盘控件（结构变化时重建列表并丢弃过期依据树），再按需本地即时推演
   pruneSandboxSelection();
@@ -537,21 +547,34 @@ function renderAll() {
 }
 
 function renderHeader() {
-  const label = S.viewingVersion ? `只读 v${S.viewingVersion}` : `v${S.work.version_id}`;
+  const label = S.viewingVersion ? `只读 v${S.viewingVersion}`
+    : S.preview ? S.preview.badge || '提案预览'
+    : `v${S.work.version_id}`;
   $('versionBadge').textContent = label;
   const n = changeCount();
-  $('dirtyCount').textContent = n ? `● ${n} 项未提交` : '';
-  $('btnCommit').disabled = !n || !$('commitMessage').value.trim() || !!S.viewingVersion;
-  $('btnDiscard').disabled = !n || !!S.viewingVersion;
-  $('viewBanner').hidden = !S.viewingVersion;
+  $('dirtyCount').textContent = (!isReadOnly() && n) ? `● ${n} 项未提交` : '';
+  $('btnCommit').disabled = isReadOnly() || !n || !$('commitMessage').value.trim();
+  $('btnDiscard').disabled = isReadOnly() || !n;
+  const btnPpSave = document.getElementById('btnPpSave');
+  if (btnPpSave) btnPpSave.disabled = isReadOnly() || !n;
+  $('viewBanner').hidden = !S.viewingVersion && !S.preview;
   if (S.viewingVersion) {
     $('viewBannerText').textContent = `正在浏览历史快照 v${S.viewingVersion}（只读）。当前最新版本为 v${S.committed.version_id}。`;
+    $('btnBackToCurrent').textContent = '返回当前版';
+    $('btnRollbackView').hidden = false;
+    $('btnBackToMerge').hidden = true;
+  } else if (S.preview) {
+    const reopen = (S.preview.kind === 'merge' && proposalUI.detail);
+    $('viewBannerText').textContent = S.preview.bannerText || '正在预览提案结果（只读，未落库）。';
+    $('btnBackToCurrent').textContent = '退出预览';
+    $('btnRollbackView').hidden = true;
+    $('btnBackToMerge').hidden = !reopen;
   }
 }
 
 function renderNodes() {
   nodeLayer.innerHTML = '';
-  const local = (!S.viewingVersion && changeCount() > 0) ? currentTimeInfo() : null;
+  const local = isDirtyEditing() ? currentTimeInfo() : null;
   // 沙盘依据树节点集合整帧只算一次
   const cfTree = (S.sandbox.active && S.sandbox.result) ? cfTreeNodeIds() : null;
   for (const n of S.work.nodes.values()) {
@@ -560,6 +583,7 @@ function renderNodes() {
     if (S.selected?.kind === 'node' && S.selected.id === n.id) g.classList.add('selected');
     if (dirtyNodeIds().has(n.id)) g.classList.add('dirty');
     if (S.affected.nodes.has(n.id)) g.classList.add('affected');
+    if (S.mergeHits.nodes.has(n.id)) g.classList.add('merge-hit');
     if (window._cycleHits?.has(n.id)) g.classList.add('cycle-hit');
     if (S.conflictHits.nodes.has(n.id) || S.localConflictHits.nodes.has(n.id)) {
       g.classList.add('conflict-hit');
@@ -623,6 +647,7 @@ function renderEdges() {
     if (S.selected?.kind === 'edge' && S.selected.id === e.id) g.classList.add('selected');
     if (dirty.has(e.id)) g.classList.add('dirty');
     if (S.affected.edges.has(e.id)) g.classList.add('affected');
+    if (S.mergeHits.edges.has(e.id)) g.classList.add('merge-hit');
     if (S.conflictHits.edges.has(e.id) || S.localConflictHits.edges.has(e.id)) {
       g.classList.add('conflict-hit');
     }
@@ -709,7 +734,7 @@ function timeEditorHtml(n, readOnly) {
 }
 
 function bindTimeEditor(nodeId) {
-  if (S.viewingVersion) return;
+  if (isReadOnly()) return;
   for (const [field, inputId] of [['earliest_time', 'dEarliest'], ['latest_time', 'dLatest']]) {
     const input = $(inputId);
     input?.addEventListener('change', () => {
@@ -748,7 +773,7 @@ function triggerModeEditorHtml(n, readOnly) {
 }
 
 function bindTriggerModeEditor(nodeId) {
-  if (S.viewingVersion) return;
+  if (isReadOnly()) return;
   $('dTriggerMode')?.addEventListener('change', (ev) => {
     const mode = ev.target.value;
     S.work.nodes.get(nodeId).trigger_mode = mode;
@@ -775,7 +800,7 @@ function evidenceEditorHtml(n, readOnly) {
 }
 
 function bindEvidenceEditor(nodeId) {
-  if (S.viewingVersion) return;
+  if (isReadOnly()) return;
   $('dReliability')?.addEventListener('change', (ev) => {
     const raw = ev.target.value.trim();
     let v = null;
@@ -805,7 +830,7 @@ function bindEvidenceEditor(nodeId) {
 /** 有效时间窗展示；tw 可能是服务端结构（effective_lower/lower_source/lower_chain）
  *  或本地结构（lower/lowerSrc/lowerChain）。 */
 function effectiveWindowHtml(nodeId, tw) {
-  const local = !S.viewingVersion && changeCount() > 0;
+  const local = isDirtyEditing();
   const lo = local ? tw.lower : tw.effective_lower;
   const hi = local ? tw.upper : tw.effective_upper;
   const loSrcId = local ? tw.lowerSrc : tw.lower_source?.node_id;
@@ -818,7 +843,7 @@ function effectiveWindowHtml(nodeId, tw) {
     : tw.upper_source?.title;
   const note = local
     ? '<p class="muted small">基于未提交工作图实时重算。</p>'
-    : (S.viewingVersion ? '<p class="muted small">按当前查看的历史版本重算。</p>'
+    : (isReadOnly() ? '<p class="muted small">按所查看的只读图（历史版本 / 提案预览）重算。</p>'
                         : '<p class="muted small">已按整图传播：下界取自身与祖先最大，上界取自身与后代最小。</p>');
   const localConflict = local && lo != null && hi != null && lo > hi
     ? S.localConflictHits.data : null;
@@ -847,7 +872,7 @@ function effectiveWindowHtml(nodeId, tw) {
 
 /** 证据强度审查展示；rv 为服务端或本地 computeEvidenceReview 的同构结果。 */
 function evidenceReviewHtml(rv) {
-  const local = !S.viewingVersion && changeCount() > 0;
+  const local = isDirtyEditing();
   const [label, cls] = STATUS_META[rv.status] || [rv.status, 'insufficient'];
   const relTxt = (x) => (x.reliability_set ? x.reliability.toFixed(2) : '未设置（按 0 计权）');
   const groupHtml = (g) => {
@@ -866,7 +891,7 @@ function evidenceReviewHtml(rv) {
   };
   const note = local
     ? '<p class="muted small">基于未提交工作图实时重算。</p>'
-    : (S.viewingVersion ? '<p class="muted small">按当前查看的历史版本重算。</p>'
+    : (isReadOnly() ? '<p class="muted small">按所查看的只读图（历史版本 / 提案预览）重算。</p>'
                         : '<p class="muted small">按当前版本计算。</p>');
   return `
     <div class="review-box status-${cls}">
@@ -891,7 +916,7 @@ function renderDetail() {
     body.innerHTML = '<p class="muted">点击节点或连线查看详情，可编辑标题/描述/标签。</p>';
     return;
   }
-  const readOnly = !!S.viewingVersion;
+  const readOnly = isReadOnly();
   if (S.selected.kind === 'node') {
     const n = S.work.nodes.get(S.selected.id);
     if (!n) { S.selected = null; return renderDetail(); }
@@ -976,7 +1001,7 @@ function renderDetail() {
 
 async function commit() {
   const message = $('commitMessage').value.trim();
-  if (!message || !changeCount() || S.viewingVersion) return;
+  if (!message || !changeCount() || isReadOnly()) return;
   $('btnCommit').disabled = true;
   try {
     const res = await api('/api/changes/commit', {
@@ -1032,13 +1057,17 @@ async function refreshVersions() {
     const li = hEl('li', { class: 'version-item' });
     if (v.id === data.current_version_id) li.classList.add('current');
     if (v.id === S.viewingVersion) li.classList.add('viewing');
+    const kindLabel = v.kind === 'commit' ? '提交' : v.kind === 'rollback' ? '回滚' : '合并';
+    const mergeMeta = (v.merged_proposal_ids && v.merged_proposal_ids.length)
+      ? `<span class="muted">合并提案 #${v.merged_proposal_ids.join(' / #')}</span>` : '';
     li.innerHTML = `
       <div class="version-head"><span>v${v.id}</span>
-        <span class="tag ${v.kind}">${v.kind === 'commit' ? '提交' : '回滚'}</span></div>
+        <span class="tag ${v.kind}">${kindLabel}</span></div>
       <div class="version-msg">${esc(v.message)}</div>
       <div class="version-meta">
         <span>${v.node_count} 节点 / ${v.edge_count} 连线</span>
         <span>${esc(v.created_at.replace('T', ' ').replace('Z', ' UTC'))}</span>
+        ${mergeMeta}
         ${v.id === data.current_version_id ? '<span class="tag current">当前</span>' : ''}
       </div>`;
     li.addEventListener('click', () => viewVersion(v.id));
@@ -1051,6 +1080,8 @@ async function viewVersion(vid) {
   S.work = snapshotFromServer(g);
   S.selected = null;
   S.viewingVersion = vid;
+  S.preview = null;
+  S.mergeHits = { nodes: new Set(), edges: new Set() };
   S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
   clearAffected();
   resetSandbox();
@@ -1113,8 +1144,8 @@ async function computeImpact(nodeId) {
     let data;
     if (S.viewingVersion) {
       data = await api(`/api/nodes/${encodeURIComponent(nodeId)}/downstream?version_id=${S.viewingVersion}`);
-    } else if (changeCount() > 0) {
-      // 工作图与服务端不同：用本地结果，注明未提交
+    } else if (isReadOnly() || changeCount() > 0) {
+      // 提案 / 合并预览图与未提交工作图都只在本地：直接对当前画布图做 BFS
       data = localImpactData(nodeId);
       data.local = true;
     } else {
@@ -1337,7 +1368,7 @@ function toggleSandboxOff() {
 
 /** 当前沙盘是否应采用本地推演：未提交工作图（含未提交的 trigger_mode/拓扑变化）即时生效。 */
 function sandboxIsLocal() {
-  return !S.viewingVersion && changeCount() > 0;
+  return isDirtyEditing();
 }
 
 async function syncSandbox() {
@@ -1345,8 +1376,8 @@ async function syncSandbox() {
   pruneSandboxSelection();
   const sb = S.sandbox;
   if (!sb.targetId) { sb.result = null; return; }
-  // 未提交工作图：本地即时推演；历史快照 / 干净当前版：调服务端按对应版本推演
-  if (sandboxIsLocal()) {
+  // 未提交工作图 / 提案与合并预览：本地即时推演；历史快照 / 干净当前版：调服务端
+  if (sandboxIsLocal() || S.preview) {
     try {
       sb.result = computeCounterfactual(S.work.nodes, S.work.edges, sb.targetId, [...sb.prevented]);
       sb.local = true;
@@ -1516,16 +1547,16 @@ function renderSandboxResult() {
 //       重算时间窗与证据审查并逐字段比对；摘要匹配且重算一致才显示「通过」。
 const pkg = { sig: '' };
 
-/** 导出可选的根事件：历史浏览 = 该快照；否则 = 已提交当前版（未提交修改不纳入导出）。 */
+/** 导出可选的根事件：历史 / 提案预览的只读图取画布；否则取已提交当前版（未提交修改不纳入）。 */
 function pkgEventNodes() {
-  const src = S.viewingVersion ? [...S.work.nodes.values()] : (S.committed?.nodes || []);
+  const src = isReadOnly() ? [...S.work.nodes.values()] : (S.committed?.nodes || []);
   return src.filter((n) => n.type === 'event')
     .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
 function renderPkgControls() {
   const events = pkgEventNodes();
-  const sig = (S.viewingVersion || 'cur') + '|' + events.map((n) => n.id).join('|');
+  const sig = (S.viewingVersion || (S.preview ? 'pv' : 'cur')) + '|' + events.map((n) => n.id).join('|');
   const sel = $('pkgEvent');
   if (pkg.sig !== sig) {
     const prev = sel.value;
@@ -1544,16 +1575,21 @@ function renderPkgControls() {
       if (events.some((n) => n.id === prev)) sel.value = prev;
     }
   }
-  $('btnPkgExport').disabled = !events.length;
-  $('pkgBasis').textContent = S.viewingVersion
-    ? `导出基于所浏览的历史快照 v${S.viewingVersion}（只读）。`
-    : `导出基于当前版 v${S.committed?.version_id ?? '-'}` +
+  $('btnPkgExport').disabled = !events.length || !!S.preview;
+  if (S.preview) {
+    $('pkgBasis').textContent = '提案预览图未落库，结论包导出仅支持已提交版本；请退出预览。';
+  } else if (S.viewingVersion) {
+    $('pkgBasis').textContent = `导出基于所浏览的历史快照 v${S.viewingVersion}（只读）。`;
+  } else {
+    $('pkgBasis').textContent = `导出基于当前版 v${S.committed?.version_id ?? '-'}` +
       (changeCount() ? '；存在未提交修改，不包含在导出中。' : '。');
+  }
 }
 
 async function exportConclusionPackage() {
   const eventId = $('pkgEvent').value;
   if (!eventId) { flashBanner('请先选择要导出的根事件。'); return; }
+  if (S.preview) { flashBanner('提案预览图未落库，不能导出结论包。'); return; }
   const qs = S.viewingVersion ? `?version_id=${S.viewingVersion}` : '';
   try {
     const res = await fetch(`/api/conclusion/export/${encodeURIComponent(eventId)}${qs}`);
@@ -2002,6 +2038,476 @@ function renderReviewMatrixTab(body, d) {
   });
 }
 
+// ---------- 变更提案：保存 / 预览 / 三方比较裁决合并 ----------
+//
+// 提案保存：把当前未提交 changeset 绑定 base_version_id 存到服务端，只在对应基线上复用
+//   整图校验，不生成版本（本地未提交修改保留）。
+// 三方合并：勾选两份同基线、未合并提案 → merge-preview 返回自动采纳项 + 冲突清单 +
+//   合并预览图；冲突逐项选 A / B / 基线 / 丢弃，提交时服务端在写事务中重合并、复查
+//   提案状态与基线版本并重跑成环 / 时间窗等整图校验，全通过才生成一个 merge 版本并
+//   同时标记两份提案已合并；任一失败不留版本或已合并状态。
+const proposalUI = {
+  list: [],
+  selected: new Set(),   // 勾选参与合并的提案 id
+  detail: null,          // 最近一次 merge-preview 结果
+  graph: null,           // 合并预览图（snapshot 结构）
+  resolutions: {},       // conflict.key -> 'a'|'b'|'base'|'drop'
+  pair: null,            // [idA, idB]
+};
+
+async function loadProposals() {
+  try {
+    const data = await api('/api/proposals');
+    proposalUI.list = data.proposals;
+    renderProposalList();
+  } catch (_) { /* 面板加载失败不阻断主流程 */ }
+}
+
+function renderProposalList() {
+  const ul = $('proposalList');
+  ul.innerHTML = '';
+  if (!proposalUI.list.length) {
+    const li = hEl('li');
+    li.className = 'muted small';
+    li.style.listStyle = 'none';
+    li.textContent = '暂无提案：在画布上做出未提交修改后，填写标题并保存。';
+    ul.appendChild(li);
+    return;
+  }
+  for (const p of proposalUI.list) {
+    const li = hEl('li', { class: 'review-item proposal-item' });
+    if (p.status === 'merged') li.classList.add('merged');
+    const checked = proposalUI.selected.has(p.id) ? 'checked' : '';
+    const disabled = p.status === 'merged' ? 'disabled' : '';
+    const mergedLine = p.status === 'merged'
+      ? `<span class="muted small">已合并入 v${p.merged_version_id}（${esc((p.merged_at || '').replace('T', ' ').replace('Z', ' UTC'))}）</span>`
+      : '';
+    li.innerHTML = `
+      <div class="version-head">
+        <label class="pp-pick"><input type="checkbox" value="${p.id}" ${checked} ${disabled}/> #${p.id} ${esc(p.title)}</label>
+        <span class="tag ${p.status === 'open' ? 'commit' : 'current'}">${p.status === 'open' ? '未合并' : '已合并'}</span>
+      </div>
+      <div class="version-meta">
+        <span>基线 v${p.base_version_id}</span>
+        <span>${p.change_count} 项修改</span>
+        <span>${esc((p.created_at || '').replace('T', ' ').replace('Z', ' UTC'))}</span>
+      </div>
+      ${mergedLine}
+      <div class="sandbox-actions" style="margin:4px 0 0">
+        <button class="btn btn-small" data-act="preview">预览</button>
+      </div>`;
+    li.querySelector('input[type=checkbox]').addEventListener('change', (ev) => {
+      const id = Number(ev.target.value);
+      if (ev.target.checked) {
+        proposalUI.selected.add(id);
+        if (proposalUI.selected.size > 2) {
+          // 只保留最近勾选的两个
+          const all = [...proposalUI.selected];
+          proposalUI.selected.delete(all[0]);
+        }
+      } else proposalUI.selected.delete(id);
+      renderProposalList();
+      updateMergeButtons();
+    });
+    li.querySelector('[data-act=preview]').addEventListener('click', () => previewProposal(p.id));
+    ul.appendChild(li);
+  }
+  updateMergeButtons();
+}
+
+function updateMergeButtons() {
+  const picks = [...proposalUI.selected];
+  let btn = document.getElementById('btnPpMerge');
+  if (!btn) return;
+  btn.disabled = picks.length !== 2;
+  btn.textContent = picks.length === 2 ? '比较这两份提案（三方合并）'
+    : `勾选两份提案后比较（已选 ${picks.length}/2）`;
+}
+
+async function saveProposal() {
+  const title = $('ppTitle').value.trim();
+  const msg = $('ppSaveMsg');
+  if (!title) { msg.textContent = '请先填写提案标题。'; msg.className = 'muted small err'; return; }
+  if (!changeCount()) { msg.textContent = '画布上没有未提交修改，先编辑后再保存。'; msg.className = 'muted small err'; return; }
+  try {
+    const res = await api('/api/proposals', {
+      method: 'POST',
+      body: JSON.stringify({ title, changes: { ...S.changes, base_version_id: S.work.version_id } }),
+    });
+    msg.textContent = '';
+    $('ppTitle').value = '';
+    toast(`提案 #${res.id} 已保存（绑定 v${res.base_version_id}，未生成版本），未提交修改仍保留`);
+    await loadProposals();
+  } catch (err) {
+    msg.textContent = '保存失败：' + err.message;
+    msg.className = 'muted small err';
+    // 复用错误高亮（成环 / 时间窗）
+    showError(err);
+  }
+}
+
+/** 单提案只读预览：画布载入「基线 + 该提案」的图。 */
+async function previewProposal(id) {
+  try {
+    proposalUI.detail = null;
+    proposalUI.pair = null;
+    const data = await api(`/api/proposals/${id}/preview`);
+    enterPreview(data.graph, {
+      kind: 'proposal',
+      badge: `提案 #${id} 预览`,
+      bannerText: `正在预览提案 #${id}「${data.proposal.title}」应用到基线 v${data.base_version_id} 的结果（只读，未落库）。`,
+      id,
+    });
+    toast(`提案 #${id} 预览（不写库、不生成版本）`);
+  } catch (err) {
+    flashBanner('预览失败：' + err.message);
+  }
+}
+
+function enterPreview(graphData, state) {
+  S.work = snapshotFromServer(graphData);
+  S.selected = null;
+  S.viewingVersion = null;
+  S.preview = state;
+  S.mergeHits = { nodes: new Set(), edges: new Set() };
+  S.conflictHits = { nodes: new Set(), edges: new Set(), data: null };
+  S.view = { ...S.view };  // 保留当前平移缩放，便于与编辑视图对照
+  clearAffected();
+  resetSandbox();
+  hideError();
+  renderAll();
+  refreshVersions();
+}
+
+async function exitPreview() {
+  if (!S.preview) return;
+  $('mergeModal').hidden = true;
+  proposalUI.detail = null;
+  await loadState();
+}
+
+/** 只收起裁决弹窗，保留画布上的合并预览（可点「返回裁决」继续）。 */
+function hideMergeModalOnly() {
+  $('mergeModal').hidden = true;
+}
+
+/** 从画布重新打开裁决弹窗（沿用最近一次 merge-preview 与已选裁决）。 */
+function reopenMergeDialog() {
+  if (!proposalUI.detail) return;
+  renderMergeDialog();
+  $('mergeModal').hidden = false;
+}
+
+// ---------- 三方合并弹窗 ----------
+
+async function openMergeDialog() {
+  const picks = [...proposalUI.selected];
+  if (picks.length !== 2) { flashBanner('请勾选恰好两份未合并提案。'); return; }
+  const [a, b] = picks;
+  proposalUI.pair = [a, b];
+  proposalUI.resolutions = {};
+  $('mergeMessage').value = '';
+  $('mergeMsg').textContent = '';
+  $('mergeModal').hidden = false;
+  await loadMergePreview();
+}
+
+async function loadMergePreview() {
+  const [a, b] = proposalUI.pair;
+  const msg = $('mergeMsg');
+  msg.textContent = '三方比较中…';
+  msg.className = 'muted small';
+  try {
+    const data = await api('/api/proposals/merge-preview', {
+      method: 'POST',
+      body: JSON.stringify({ proposal_a_id: a, proposal_b_id: b }),
+    });
+    proposalUI.detail = data;
+    proposalUI.graph = data.merged_graph_full;
+    renderMergeDialog();
+    // 同时在画布载入合并预览图（未裁决时冲突项保持基线值），便于定位
+    enterPreview(data.merged_graph_full, {
+      kind: 'merge',
+      badge: '合并预览',
+      bannerText: `合并预览：提案 #${a} × #${b}（基线 v${data.base_version_id}）。冲突项在裁决前暂取基线值；点击冲突行可定位。`,
+      id: null,
+      pair: [a, b],
+    });
+    $('mergeModal').hidden = false;
+  } catch (err) {
+    msg.textContent = '比较失败：' + err.message;
+    msg.className = 'muted small err';
+  }
+}
+
+const FIELD_LABELS = {
+  title: '标题', description: '描述', pos_x: '横坐标', pos_y: '纵坐标',
+  earliest_time: '最早发生时间', latest_time: '最晚发生时间',
+  reliability: '可靠度', source_group: '来源组', trigger_mode: '触发模式',
+  kind: '连线类型', label: '连线说明', source_id: '起点', target_id: '终点',
+};
+const SIDE_META = {
+  a: ['提案 A', 'side-a'], b: ['提案 B', 'side-b'],
+  base: ['基线', 'side-base'], both_same: ['双方相同', 'side-both'],
+};
+
+function fmtVal(v) {
+  if (v === null || v === undefined) return '（空 / 删除）';
+  if (typeof v === 'object') {
+    if ('kind' in v && 'source_id' in v) return `${v.source_id} → ${v.target_id} · ${v.kind}${v.label ? ' · ' + v.label : ''}`;
+    return Object.entries(v).filter(([, x]) => x !== null && x !== '')
+      .map(([k, x]) => `${FIELD_LABELS[k] || k}=${x}`).join('，') || '（空）';
+  }
+  return String(v);
+}
+
+function entityName(c) {
+  if (c.subject === 'edge') return c.title || `${c.source_id || '?'} → ${c.target_id || '?'}`;
+  return c.title || c.id;
+}
+
+function renderMergeDialog() {
+  const d = proposalUI.detail;
+  if (!d) return;
+  const pA = d.proposal_a, pB = d.proposal_b;
+  $('mergeModalTitle').textContent = `三方合并：#${pA.id} × #${pB.id}`;
+  $('mergeMeta').innerHTML = `
+    基线 <b>v${d.base_version_id}</b> ·
+    <span class="merge-side side-a">提案 A：#${pA.id} ${esc(pA.title)}</span> ·
+    <span class="merge-side side-b">提案 B：#${pB.id} ${esc(pB.title)}</span>
+    · 当前最新版本 <b>v${d.current_version_id}</b>
+    ${d.base_is_current ? '' : '<span class="merge-warn">⚠ 基线已不是当前版本，提交将被拒绝</span>'}`;
+
+  // 警告：成环 / 时间窗（裁决后整图校验仍会拦截）
+  const warns = [];
+  if (d.cycle) warns.push(`⚠ 预览图当前成环：${d.cycle.join(' → ')}（落库前的整图校验会拒绝）`);
+  if (d.time_conflict) warns.push(`⚠ 预览图存在时间窗冲突：${esc(d.time_conflict.node_title)}（落库将被拒绝）`);
+  if (d.dangling && d.dangling.length) warns.push(`⚠ 有 ${d.dangling.length} 条连线端点已不存在，需要先裁决相关节点冲突`);
+  $('mergeWarnings').innerHTML = warns.length
+    ? warns.map((w) => `<div class="merge-warn">${w}</div>`).join('') : '';
+
+  // 自动采纳
+  $('mergeAutoCount').textContent = d.auto_resolved.length;
+  $('mergeAuto').innerHTML = d.auto_resolved.length
+    ? d.auto_resolved.map(autoRow).join('') : '<p class="muted small">无自动采纳项。</p>';
+
+  // 冲突
+  $('mergeConflictCount').textContent = d.conflicts.length;
+  $('mergeConflicts').innerHTML = d.conflicts.length
+    ? d.conflicts.map(conflictRow).join('')
+    : '<p class="muted small">没有冲突，全部修改可自动合并，直接填写说明后生成合并版本即可。</p>';
+
+  d.conflicts.forEach((c) => {
+    const chosen = proposalUI.resolutions[c.key];
+    document.querySelectorAll(`input[name="${cssName(c.key)}"]`).forEach((radio) => {
+      radio.checked = (radio.value === chosen) || (!chosen && radio.value === 'base');
+      radio.addEventListener('change', () => {
+        proposalUI.resolutions[c.key] = radio.value;
+        updateMergeCommitState();
+      });
+    });
+    document.querySelectorAll(`[data-locate="${esc(c.key)}"]`).forEach((btn) => {
+      btn.addEventListener('click', () => locateConflict(c));
+    });
+  });
+  updateMergeCommitState();
+}
+
+function cssName(key) { return 'cf-' + key.replace(/[^A-Za-z0-9_-]/g, '_'); }
+
+function autoRow(x) {
+  const [label, cls] = SIDE_META[x.side] || [x.side, ''];
+  const action = { create: '新建', delete: '删除', field_change: '修改' }[x.action] || x.action;
+  const field = x.field ? ` · ${FIELD_LABELS[x.field] || x.field}` : '';
+  const subj = x.subject === 'edge' ? '连线' : '节点';
+  return `<div class="merge-row auto ${cls}">
+    <span class="merge-kind">${action}</span>
+    <span class="merge-name">${subj} ${esc(x.title || x.id)}${field}</span>
+    <span class="merge-side-tag ${cls}">${label}</span>
+  </div>`;
+}
+
+function conflictRow(c) {
+  const subj = c.subject === 'edge' ? '连线' : '节点';
+  let head;
+  if (c.type === 'value_diverge') {
+    head = `${subj}「${esc(entityName(c))}」的 ${esc(c.field_label || c.field)} 被改成不同值`;
+  } else if (c.type === 'delete_modify') {
+    const del = c.deleted_side === 'a' ? 'A' : 'B';
+    const kept = c.kept_side === 'a' ? 'A' : 'B';
+    head = `${subj}「${esc(entityName(c))}」：提案 ${del} 删除，提案 ${kept} 修改`;
+  } else {
+    head = `${subj}「${esc(entityName(c))}」被双方以相同 id 新建，但内容不同`;
+  }
+  const radios = c.options.map((opt) => {
+    const [label, cls] = SIDE_META[opt] || [opt, ''];
+    const valText = opt === 'a' ? fmtVal(c.a_value) : opt === 'b' ? fmtVal(c.b_value)
+      : c.type === 'create_create' ? '双方都不采纳（丢弃该新建）' : `保留基线：${fmtVal(c.base_value)}`;
+    return `<label class="cf-choice ${cls}">
+      <input type="radio" name="${cssName(c.key)}" value="${opt}"/>
+      <span class="merge-side-tag ${cls}">${label}</span>
+      <span class="cf-val">${esc(valText.length > 120 ? valText.slice(0, 120) + '…' : valText)}</span>
+    </label>`;
+  }).join('');
+  return `<div class="merge-row conflict" data-conflict="${esc(c.key)}">
+    <div class="cf-head">
+      <span>${head}</span>
+      <button type="button" class="btn btn-small" data-locate="${esc(c.key)}">定位</button>
+    </div>
+    <div class="cf-options">${radios}</div>
+  </div>`;
+}
+
+function updateMergeCommitState() {
+  const d = proposalUI.detail;
+  if (!d) return;
+  const allChosen = d.conflicts.every((c) => proposalUI.resolutions[c.key]);
+  const stale = !d.base_is_current;
+  $('btnMergeCommit').disabled = !allChosen || stale || !$('mergeMessage').value.trim();
+  $('mergeMsg').textContent = d.conflicts.length
+    ? (allChosen ? '全部冲突已裁决，可以生成合并版本。'
+      : `还有 ${d.conflicts.filter((c) => !proposalUI.resolutions[c.key]).length} 项冲突未裁决。`)
+    : '无冲突。';
+  $('mergeMsg').className = 'muted small';
+}
+
+/** 冲突定位：收起弹窗，在画布上居中高亮对应节点 / 连线并选中。 */
+function locateConflict(c) {
+  const hits = { nodes: new Set(), edges: new Set() };
+  let center = null;
+  if (c.subject === 'node') {
+    if (S.work.nodes.has(c.id)) {
+      hits.nodes.add(c.id);
+      S.selected = { kind: 'node', id: c.id };
+      const n = S.work.nodes.get(c.id);
+      center = { x: n.pos_x + NODE_W / 2, y: n.pos_y + NODE_H / 2 };
+    }
+  } else {
+    if (S.work.edges.has(c.id)) {
+      hits.edges.add(c.id);
+      S.selected = { kind: 'edge', id: c.id };
+      const e = S.work.edges.get(c.id);
+      const s = S.work.nodes.get(e.source_id), t = S.work.nodes.get(e.target_id);
+      if (s && t) center = { x: (s.pos_x + t.pos_x) / 2 + NODE_W / 2, y: (s.pos_y + t.pos_y) / 2 };
+    }
+    if (c.source_id && S.work.nodes.has(c.source_id)) hits.nodes.add(c.source_id);
+    if (c.target_id && S.work.nodes.has(c.target_id)) hits.nodes.add(c.target_id);
+  }
+  S.mergeHits = hits;
+  if (center) {
+    const r = svg.getBoundingClientRect();
+    S.view.x = r.width / 2 - center.x * S.view.k;
+    S.view.y = r.height / 2 - center.y * S.view.k;
+  }
+  hideMergeModalOnly();
+  applyView();
+  renderNodes();
+  renderEdges();
+  renderDetail();
+  toast(`已定位冲突：${c.field_label ? entityName(c) + ' · ' + c.field_label : entityName(c)}（裁决弹窗已收起，点「返回裁决」继续）`);
+}
+
+async function previewMergeResult() {
+  // 当前的客户端裁决即时映射到预览图（服务端最终仍会重新合并校验）
+  const d = proposalUI.detail;
+  if (!d) return;
+  try {
+    const g = applyResolutionsLocally(d);
+    proposalUI.graph = g;
+    enterPreview(g, {
+      kind: 'merge',
+      badge: '合并预览（已裁决）',
+      bannerText: `按当前裁决生成的合并预览（仍未落库；提交时服务端会重新合并并做整图校验）。`,
+      id: null, pair: proposalUI.pair,
+    });
+    $('mergeModal').hidden = false;
+    toast('已按裁决刷新合并预览');
+  } catch (err) {
+    flashBanner(err.message);
+  }
+}
+
+/** 轻量本地映射：基于最近一次 merge-preview 的三方图与裁决，直接改出预览图。
+ *  实现上再次请求服务端代价大；这里只处理冲突节点字段 / 实体取舍，自动项已在预览图里。 */
+function applyResolutionsLocally(d) {
+  const g = d.merged_graph_full;
+  const nodes = new Map(g.nodes.map((n) => [n.id, structuredClone(n)]));
+  const edges = new Map(g.edges.map((e) => [e.id, structuredClone(e)]));
+  for (const c of d.conflicts) {
+    const choice = proposalUI.resolutions[c.key] || 'base';
+    const pickVal = choice === 'a' ? c.a_value : choice === 'b' ? c.b_value : c.base_value;
+    if (c.type === 'value_diverge') {
+      const obj = c.subject === 'node' ? nodes.get(c.id) : edges.get(c.id);
+      if (obj && pickVal !== null && typeof pickVal !== 'object') obj[c.field] = pickVal;
+    } else if (c.type === 'create_create') {
+      if (choice === 'drop') {
+        if (c.subject === 'node') { nodes.delete(c.id); [...edges.values()].forEach((e) => {
+          if (e.source_id === c.id || e.target_id === c.id) edges.delete(e.id);
+        }); }
+        else edges.delete(c.id);
+      } else {
+        const vals = pickVal;
+        if (c.subject === 'node' && vals) {
+          nodes.set(c.id, { ...nodes.get(c.id), ...vals, id: c.id });
+        } else if (vals) {
+          edges.set(c.id, { ...edges.get(c.id), ...vals, id: c.id });
+        }
+      }
+    } else if (c.type === 'delete_modify') {
+      if (choice === 'a' || choice === 'b') {
+        if (pickVal === null) {
+          // 选中删除侧
+          if (c.subject === 'node') {
+            nodes.delete(c.id);
+            [...edges.values()].forEach((e) => {
+              if (e.source_id === c.id || e.target_id === c.id) edges.delete(e.id);
+            });
+          } else edges.delete(c.id);
+        } else if (c.subject === 'node') {
+          nodes.set(c.id, { ...nodes.get(c.id), ...pickVal, id: c.id });
+        } else if (pickVal && typeof pickVal === 'object') {
+          edges.set(c.id, { ...edges.get(c.id), ...pickVal, id: c.id });
+        }
+      }
+      // base：预览图（未裁决即基线占位）本身已保留基线，无需改动
+    }
+  }
+  return { version_id: d.base_version_id, nodes: [...nodes.values()], edges: [...edges.values()] };
+}
+
+async function commitMerge() {
+  const d = proposalUI.detail;
+  if (!d) return;
+  const message = $('mergeMessage').value.trim();
+  if (!message) { flashBanner('请填写合并版本说明。'); return; }
+  const missing = d.conflicts.filter((c) => !proposalUI.resolutions[c.key]);
+  if (missing.length) { flashBanner(`还有 ${missing.length} 项冲突未裁决。`); return; }
+  const resolutions = Object.entries(proposalUI.resolutions).map(([key, choice]) => ({ key, choice }));
+  $('btnMergeCommit').disabled = true;
+  try {
+    const res = await api('/api/proposals/merge', {
+      method: 'POST',
+      body: JSON.stringify({
+        proposal_a_id: proposalUI.pair[0], proposal_b_id: proposalUI.pair[1],
+        message, resolutions,
+      }),
+    });
+    toast(`已生成合并版本 v${res.version_id}，两份提案已同时标记为已合并`);
+    $('mergeModal').hidden = true;
+    proposalUI.selected.clear();
+    await loadState();
+  } catch (err) {
+    $('mergeMsg').textContent = '合并被拒绝（未留下版本或已合并状态）：' + err.message;
+    $('mergeMsg').className = 'muted small err';
+    // 成环 / 时间窗 / 基线过期等：刷新预览与提案状态
+    await loadProposals();
+    if (err.payload?.code === 'stale_conflict' || err.payload?.code === 'proposal_already_merged') {
+      await loadMergePreview();
+    }
+    $('btnMergeCommit').disabled = false;
+  }
+}
+
 // ---------- 指针交互（平移 / 拖节点 / 拉线） ----------
 
 const drag = { mode: null };
@@ -2012,7 +2518,7 @@ svg.addEventListener('pointerdown', (ev) => {
   const nodeG = ev.target.closest?.('.node');
   const edgeG = ev.target.closest?.('.edge');
 
-  if (port && !S.viewingVersion) {
+  if (port && !isReadOnly()) {
     const g = port.closest('.node');
     startConnect(g.dataset.nodeId, ev);
   } else if (nodeG) {
@@ -2026,7 +2532,7 @@ svg.addEventListener('pointerdown', (ev) => {
 });
 
 function startNodeDrag(nodeId, ev) {
-  if (S.viewingVersion) { S.selected = { kind: 'node', id: nodeId }; renderAll(); return; }
+  if (isReadOnly()) { S.selected = { kind: 'node', id: nodeId }; renderAll(); return; }
   const w0 = toWorld(ev.clientX, ev.clientY);
   const n = S.work.nodes.get(nodeId);
   drag.mode = 'node';
@@ -2091,7 +2597,7 @@ function positionNodeGroup(id, n) {
 svg.addEventListener('pointerup', (ev) => {
   svg.classList.remove('panning', 'connecting');
   if (drag.mode === 'node') {
-    if (drag.moved && !S.viewingVersion) {
+    if (drag.moved && !isReadOnly()) {
       const n = S.work.nodes.get(drag.nodeId);
       stageNodeUpdate(drag.nodeId, { pos_x: n.pos_x, pos_y: n.pos_y });
     }
@@ -2112,7 +2618,7 @@ svg.addEventListener('pointercancel', () => {
 
 function finishConnect(targetId) {
   const sourceId = drag.sourceId;
-  if (!targetId || targetId === sourceId || S.viewingVersion) return;
+  if (!targetId || targetId === sourceId || isReadOnly()) return;
   const src = S.work.nodes.get(sourceId);
   const dst = S.work.nodes.get(targetId);
   // 依据端点类型自动判定连线种类
@@ -2182,7 +2688,7 @@ function bindUI() {
   }));
 
   $('btnAddNode').addEventListener('click', () => {
-    if (S.viewingVersion) return;
+    if (isReadOnly()) return;
     const title = $('newTitle').value.trim();
     if (!title) { $('newTitle').focus(); return; }
     let reliability = null, sourceGroup = null;
@@ -2207,9 +2713,25 @@ function bindUI() {
   $('commitMessage').addEventListener('input', renderHeader);
   $('btnCloseError').addEventListener('click', hideError);
 
-  $('btnBackToCurrent').addEventListener('click', backToCurrent);
+  $('btnBackToCurrent').addEventListener('click', () => {
+    if (S.preview) void exitPreview();
+    else void backToCurrent();
+  });
   $('btnRollbackView').addEventListener('click', rollbackViewing);
   $('btnRefreshVersions').addEventListener('click', refreshVersions);
+
+  // 变更提案：保存 / 刷新 / 三方比较 / 预览 / 裁决
+  $('btnPpSave').addEventListener('click', () => { void saveProposal(); });
+  $('btnPpRefresh').addEventListener('click', () => { void loadProposals(); });
+  $('btnPpMerge').addEventListener('click', () => { void openMergeDialog(); });
+  $('btnMergeClose').addEventListener('click', hideMergeModalOnly);
+  $('btnBackToMerge').addEventListener('click', reopenMergeDialog);
+  $('mergeModal').addEventListener('click', (ev) => {
+    if (ev.target === $('mergeModal')) hideMergeModalOnly();
+  });
+  $('btnMergePreview').addEventListener('click', () => { void previewMergeResult(); });
+  $('btnMergeCommit').addEventListener('click', () => { void commitMerge(); });
+  $('mergeMessage').addEventListener('input', updateMergeCommitState);
 
   // 反事实干预沙盘
   $('sandboxTarget').addEventListener('change', (ev) => {
@@ -2264,11 +2786,12 @@ function bindUI() {
   document.addEventListener('keydown', (ev) => {
     const tag = ev.target.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-    if ((ev.key === 'Delete' || ev.key === 'Backspace') && S.selected && !S.viewingVersion) {
+    if ((ev.key === 'Delete' || ev.key === 'Backspace') && S.selected && !isReadOnly()) {
       ev.preventDefault();
       deleteSelected();
     }
     if (ev.key === 'Escape') {
+      if (!$('mergeModal').hidden) { hideMergeModalOnly(); return; }
       if (!$('reviewModal').hidden) { closeReviewModal(); return; }
       S.selected = null;
       renderAll();

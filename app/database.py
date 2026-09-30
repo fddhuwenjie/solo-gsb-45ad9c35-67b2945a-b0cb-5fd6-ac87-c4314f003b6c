@@ -88,6 +88,23 @@ CREATE TABLE IF NOT EXISTS review_ballots (
     submitted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     PRIMARY KEY (session_id, reviewer)
 );
+
+-- 变更提案：把一组未提交修改（changeset）保存为绑定 base_version_id 的提案，
+-- 保存时只在对应基线上做整图校验，不生成版本；两份同基线、未合并的提案可经
+-- 三方裁决合并为一个 kind='merge' 的版本，随后两份提案同时标记为 merged。
+CREATE TABLE IF NOT EXISTS proposals (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    title              TEXT NOT NULL,
+    base_version_id    INTEGER NOT NULL REFERENCES versions(id),
+    changes_json       TEXT NOT NULL CHECK (json_valid(changes_json)),  -- 与 /api/changes/commit 同构的 changeset
+    status             TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'merged')),
+    merged_version_id  INTEGER REFERENCES versions(id),  -- 合并生成的版本（open 时恒为 NULL）
+    created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    merged_at          TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_proposals_base ON proposals(base_version_id);
+CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status);
 """
 
 # (id, type, title, desc, x, y, earliest_time_utc, latest_time_utc, reliability, source_group, trigger_mode)
@@ -141,12 +158,13 @@ def connect() -> sqlite3.Connection:
 
 
 def init_db(conn: sqlite3.Connection) -> None:
-    """建表；为旧库补齐证据强度列 / refutes 连线类型（幂等）；versions 为空时写入 v1 示例快照。"""
+    """建表；为旧库补齐列与约束（幂等）；versions 为空时写入 v1 示例快照。"""
     conn.executescript(SCHEMA)
     _migrate_time_columns(conn)
     _migrate_evidence_columns(conn)
     _migrate_trigger_mode(conn)
     _migrate_edge_kinds(conn)
+    _migrate_version_kinds(conn)
     count = conn.execute("SELECT COUNT(*) FROM versions").fetchone()[0]
     if count == 0:
         cur = conn.execute(
@@ -201,11 +219,16 @@ def _migrate_trigger_mode(conn: sqlite3.Connection) -> None:
 def _migrate_edge_kinds(conn: sqlite3.Connection) -> None:
     """旧库 edges.kind 的 CHECK 不含 'refutes'；SQLite 不能改 CHECK，按官方方式重建表。
 
+    重建子表同样属于「12 步表重建」范畴：必须在 foreign_keys=OFF 下进行，否则改名后
+    该表指向 versions 的外键注册会丢失（pragma 仍显示 ON，但约束不再生效）。
     幂等：检测建表 SQL 中已含 'refutes' 则跳过；历史行原样复制，不改写任何数据。
     """
     row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='edges'").fetchone()
     if row is None or "'refutes'" in (row["sql"] or ""):
         return
+    fk_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if fk_on:
+        conn.execute("PRAGMA foreign_keys = OFF")
     conn.executescript("""
         CREATE TABLE edges_new (
             id          TEXT NOT NULL,
@@ -223,3 +246,44 @@ def _migrate_edge_kinds(conn: sqlite3.Connection) -> None:
         ALTER TABLE edges_new RENAME TO edges;
         CREATE INDEX IF NOT EXISTS idx_edges_version ON edges(version_id);
     """)
+    bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if bad:
+        raise RuntimeError(f"edges 表重建后外键校验失败：{bad[:5]}")
+    if fk_on:
+        conn.execute("PRAGMA foreign_keys = ON")
+
+
+def _migrate_version_kinds(conn: sqlite3.Connection) -> None:
+    """旧库 versions.kind 的 CHECK 不含 'merge'（提案三方合并生成）；按官方 12 步方式重建表。
+
+    versions 被 nodes / edges / review_sessions / proposals 等子表以外键引用：
+    重建期间临时关闭 foreign_keys（autocommit 连接，开关即事务边界），改名后子表的
+    REFERENCES versions(id) 按表名重新解析到新表；迁移后跑 foreign_key_check 兜底。
+    幂等：建表 SQL 已含 'merge' 则跳过，历史行原样复制。
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='versions'"
+    ).fetchone()
+    if row is None or "'merge'" in (row["sql"] or ""):
+        return
+    fk_on = conn.execute("PRAGMA foreign_keys").fetchone()[0]
+    if fk_on:
+        conn.execute("PRAGMA foreign_keys = OFF")
+    conn.executescript("""
+        CREATE TABLE versions_new (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            message     TEXT NOT NULL,
+            kind        TEXT NOT NULL CHECK (kind IN ('commit', 'rollback', 'merge')),
+            base_id     INTEGER REFERENCES versions(id),
+            created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        INSERT INTO versions_new (id, message, kind, base_id, created_at)
+            SELECT id, message, kind, base_id, created_at FROM versions;
+        DROP TABLE versions;
+        ALTER TABLE versions_new RENAME TO versions;
+    """)
+    bad = conn.execute("PRAGMA foreign_key_check").fetchall()
+    if bad:  # 理论不会发生（只改 CHECK 不动数据），防御性报错比静默破坏外键更安全
+        raise RuntimeError(f"versions 表重建后外键校验失败：{bad[:5]}")
+    if fk_on:
+        conn.execute("PRAGMA foreign_keys = ON")

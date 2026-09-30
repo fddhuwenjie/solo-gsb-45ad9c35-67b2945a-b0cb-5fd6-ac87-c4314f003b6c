@@ -106,6 +106,35 @@ class CommitResponse(BaseModel):
     created_at: str
 
 
+# ---------- 变更提案 / 三方合并 ----------
+
+class ProposalSaveRequest(BaseModel):
+    # 提案标题（不生成版本，只把 changeset 绑定到 base_version_id 保存）
+    title: str = Field(min_length=1, max_length=200)
+    changes: Changeset
+
+
+class MergePreviewRequest(BaseModel):
+    # 两个必须同基线、且均未合并的提案 id
+    proposal_a_id: int = Field(ge=1)
+    proposal_b_id: int = Field(ge=1)
+
+
+class MergeResolutionItem(BaseModel):
+    # 与合并预览返回的 conflict.key 一一对应；
+    # choice：a=采纳提案 A，b=采纳提案 B，base=保留基线，drop=丢弃双方新建
+    key: str = Field(min_length=1, max_length=200)
+    choice: Literal["a", "b", "base", "drop"]
+
+
+class MergeCommitRequest(BaseModel):
+    proposal_a_id: int = Field(ge=1)
+    proposal_b_id: int = Field(ge=1)
+    message: str = Field(min_length=1, max_length=200)
+    # 逐项裁决；无冲突时为空数组。服务端会重新计算冲突并核对 key 全集
+    resolutions: list[MergeResolutionItem] = []
+
+
 # ---------- 回滚 ----------
 
 class RollbackRequest(BaseModel):
